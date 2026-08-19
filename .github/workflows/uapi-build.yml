@@ -1,0 +1,150 @@
+name: U-API Connect build and validation
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uapi-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Distribution policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate distribution manifest
+        run: node --test scripts/uapi/tests/distribution.test.mjs
+      - name: Audit customization surface
+        run: bash scripts/uapi/audit-upstream-surface.sh
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/uapi/audit-upstream-surface.sh
+          bash -n scripts/uapi/package-macos-dmg.sh
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Install NSIS
+        run: choco install nsis -y
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: node --experimental-strip-types --test "src/*.test.ts"
+      - name: Distribution tests
+        run: node --test scripts/uapi/tests/distribution.test.mjs
+      - name: TypeScript check
+        working-directory: apps/codex-plus-manager
+        run: npm run check
+      - name: Frontend build
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Build release binaries
+        run: cargo build --release
+      - name: Stage application
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/uapi/windows/app | Out-Null
+          Copy-Item target/release/codex-plus-plus.exe dist/uapi/windows/app/
+          Copy-Item target/release/codex-plus-plus-manager.exe dist/uapi/windows/app/
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = "1.2.49-uapi.${{ github.run_number }}"
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { $makensis = "makensis" }
+          Push-Location scripts/uapi/installer/windows
+          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" UAPIConnect.nsi
+          Pop-Location
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: uapi-connect-windows-x64
+          path: dist/uapi/windows/*.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/codex-plus-manager/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: node --experimental-strip-types --test "src/*.test.ts"
+      - name: Distribution tests
+        run: node --test scripts/uapi/tests/distribution.test.mjs
+      - name: TypeScript check
+        working-directory: apps/codex-plus-manager
+        run: npm run check
+      - name: Frontend build
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package DMG
+        env:
+          BINARY_DIR: ${{ github.workspace }}/target/${{ matrix.target }}/release
+        run: bash scripts/uapi/package-macos-dmg.sh "1.2.49-uapi.${GITHUB_RUN_NUMBER}" "${{ matrix.arch }}"
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: uapi-connect-macos-${{ matrix.arch }}
+          path: dist/uapi/macos/*.dmg
+          if-no-files-found: error

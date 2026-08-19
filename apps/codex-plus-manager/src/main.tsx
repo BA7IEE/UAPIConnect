@@ -1,14 +1,12 @@
 import { createRoot } from "react-dom/client";
-import { App } from "./App";
+import { UapiApp } from "./uapi/UapiApp";
 import "./styles.css";
 
-/* ── Bundled fonts (offline, no Google Fonts request) ──
-     Fontsource packages ship woff2 files that Vite bundles into dist/.
-     CSS @font-face declarations are injected at build time.              */
+/* Bundled font files stay offline and are emitted by Vite. */
 import "@fontsource/jetbrains-mono";
 
 const app = document.getElementById("app");
 
 if (app instanceof HTMLElement) {
-  createRoot(app).render(<App />);
+  createRoot(app).render(<UapiApp />);
 }

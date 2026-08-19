@@ -2,6 +2,9 @@
 
 fn main() {
     for arg in std::env::args() {
+        if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+            continue;
+        }
         if arg.starts_with("dreamskin://") {
             if codex_plus_manager_lib::handle_dream_skin_url(&arg) {
                 codex_plus_manager_lib::focus_existing_manager_window();
@@ -29,9 +32,16 @@ fn main() {
             }
         }
     }
-    if std::env::args().any(|arg| arg == "--show-update") {
+    if codex_plus_core::distribution::UPDATES_ENABLED
+        && std::env::args().any(|arg| arg == "--show-update")
+    {
         unsafe {
             std::env::set_var("CODEX_PLUS_SHOW_UPDATE", "1");
+        }
+    }
+    if std::env::args().any(|arg| arg == "--configure") {
+        unsafe {
+            std::env::set_var("UAPI_CONNECT_CONFIGURE", "1");
         }
     }
     codex_plus_manager_lib::run();

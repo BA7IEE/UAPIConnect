@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod install;
+pub mod uapi_commands;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -26,7 +27,8 @@ pub fn run() {
     let Some(_guard) = acquire_single_instance_guard() else {
         return;
     };
-    if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load()
+    if !codex_plus_core::distribution::FIXED_PROVIDER_EDITION
+        && let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load()
         && let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
             settings.enhancements_enabled
                 && settings.codex_app_dream_skin_enabled
@@ -39,18 +41,22 @@ pub fn run() {
             serde_json::json!({ "message": error.to_string() }),
         );
     }
-    let show_update = commands::startup_should_show_update();
+    let show_update = codex_plus_core::distribution::UPDATES_ENABLED
+        && commands::startup_should_show_update();
     let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            let url = if show_update {
+            let configure = std::env::var("UAPI_CONNECT_CONFIGURE").ok().as_deref() == Some("1");
+            let url = if configure {
+                "/index.html?configure=1"
+            } else if show_update {
                 "/index.html?showUpdate=1"
             } else {
                 "/index.html"
             };
             let mut main_window_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
-                    .title("Codex++ 管理工具")
+                    .title(codex_plus_core::distribution::MANAGER_TITLE)
                     .inner_size(1180.0, 820.0)
                     .min_inner_size(960.0, 720.0);
             if let Some(icon) = app.default_window_icon().cloned() {
@@ -58,12 +64,19 @@ pub fn run() {
             }
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
-            commands::start_weixin_connect_from_saved_settings();
+            if !codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+                commands::start_weixin_connect_from_saved_settings();
+            }
             register_main_window_events(main_window, startup_is_transient());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::backend_version,
+            uapi_commands::uapi_status,
+            uapi_commands::uapi_validate_key,
+            uapi_commands::uapi_configure,
+            uapi_commands::uapi_refresh_models,
+            uapi_commands::uapi_diagnostics,
             commands::startup_options,
             commands::load_overview,
             commands::launch_codex_plus,
@@ -187,6 +200,9 @@ pub fn run() {
 }
 
 pub fn handle_dream_skin_url(url: &str) -> bool {
+    if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+        return false;
+    }
     if !url.starts_with("dreamskin://") {
         return false;
     }
@@ -218,7 +234,11 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let quit_item = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出程序", true, None::<&str>)?;
-    let tray_menu = Menu::with_items(app, &[&show_item, &apply_skin_item, &quit_item])?;
+    let tray_menu = if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+        Menu::with_items(app, &[&show_item, &quit_item])?
+    } else {
+        Menu::with_items(app, &[&show_item, &apply_skin_item, &quit_item])?
+    };
 
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&tray_menu)

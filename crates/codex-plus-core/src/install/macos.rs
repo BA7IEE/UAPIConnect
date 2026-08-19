@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use super::{
-    InstallOptions, MANAGER_BINARY, MANAGER_NAME, MacosAppBundle, SILENT_BINARY, SILENT_NAME,
+    InstallOptions, MANAGER_BINARY, MANAGER_BUNDLE_ID, MANAGER_NAME, MacosAppBundle, SILENT_BINARY, SILENT_BUNDLE_ID, SILENT_NAME,
     install_root_or_default, option_or_current_exe,
 };
 
@@ -33,10 +33,10 @@ pub fn build_app_bundle(options: &InstallOptions, manager: bool) -> MacosAppBund
         ),
         binary,
     );
-    let identifier_suffix = if manager { ".manager" } else { "" };
+    let bundle_id = if manager { MANAGER_BUNDLE_ID } else { SILENT_BUNDLE_ID };
     MacosAppBundle {
         app_path: install_root.join(format!("{display_name}.app")),
-        info_plist: info_plist(display_name, executable_name, identifier_suffix),
+        info_plist: info_plist(display_name, executable_name, bundle_id, manager),
         launch_script: launch_script(binary),
         binary_source: Some(binary_source),
         binary_target_name: Some(binary.to_string()),
@@ -156,18 +156,17 @@ fn executable_name_from_plist(plist: &str) -> String {
         .to_string()
 }
 
-fn info_plist(display_name: &str, executable_name: &str, identifier_suffix: &str) -> String {
+fn info_plist(display_name: &str, executable_name: &str, bundle_id: &str, manager: bool) -> String {
     let version = crate::version::VERSION;
-    let url_types = if identifier_suffix == ".manager" {
+    let url_types = if manager {
         r#"  <key>CFBundleURLTypes</key>
   <array>
     <dict>
       <key>CFBundleURLName</key>
-      <string>Codex++ Links</string>
+      <string>U-API Connect Links</string>
       <key>CFBundleURLSchemes</key>
       <array>
-        <string>codexplusplus</string>
-        <string>dreamskin</string>
+        <string>uapiconnect</string>
       </array>
     </dict>
   </array>
@@ -185,7 +184,7 @@ fn info_plist(display_name: &str, executable_name: &str, identifier_suffix: &str
   <key>CFBundleDisplayName</key>
   <string>{display_name}</string>
   <key>CFBundleIdentifier</key>
-  <string>com.bigpizzav3.codexplusplus{identifier_suffix}</string>
+  <string>{bundle_id}</string>
   <key>CFBundleVersion</key>
   <string>{version}</string>
   <key>CFBundleShortVersionString</key>

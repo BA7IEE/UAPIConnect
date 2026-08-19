@@ -85,6 +85,29 @@ async fn launcher_main(
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
+    if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+        if let Err(error) = codex_plus_core::uapi::enforce_distribution_defaults() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "uapi.distribution_defaults_failed_nonfatal",
+                json!({ "message": error.to_string() }),
+            );
+        }
+        let status = codex_plus_core::uapi::status();
+        if !status.configured {
+            codex_plus_core::install::spawn_companion(
+                codex_plus_core::install::MANAGER_BINARY,
+                ["--configure"],
+            )
+            .map_err(|error| anyhow::anyhow!("启动连接设置失败：{error}"))?;
+            return Ok(());
+        }
+        if let Err(error) = codex_plus_core::uapi::refresh_models().await {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "uapi.models_refresh_failed_nonfatal",
+                json!({ "message": error.to_string() }),
+            );
+        }
+    }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
@@ -99,9 +122,11 @@ async fn launcher_main(
         })?;
         return Ok(());
     };
-    tokio::spawn(async {
-        let _ = notify_manager_when_update_available().await;
-    });
+    if codex_plus_core::distribution::UPDATES_ENABLED {
+        tokio::spawn(async {
+            let _ = notify_manager_when_update_available().await;
+        });
+    }
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
