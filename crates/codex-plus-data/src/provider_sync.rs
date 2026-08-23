@@ -305,6 +305,24 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
     thread_id: &str,
     target_provider: &str,
 ) -> ProviderSyncResult {
+    run_remote_control_session_finalization_with_before_apply(
+        codex_home,
+        thread_id,
+        target_provider,
+        |_| {},
+    )
+}
+
+fn run_remote_control_session_finalization_with_before_apply<F>(
+    codex_home: Option<&Path>,
+    thread_id: &str,
+    target_provider: &str,
+    before_apply: F,
+) -> ProviderSyncResult
+where
+    F: FnOnce(&Path),
+{
+    let mut before_apply = Some(before_apply);
     let thread_id = thread_id.trim();
     let target_provider = target_provider.trim();
     if thread_id.is_empty()
@@ -388,6 +406,9 @@ pub fn run_remote_control_session_finalization_for_thread_with_target(
             .cloned()
             .collect::<Vec<_>>();
         let backup_dir = create_backup(&home, target_provider, &rewrite_changes)?;
+        if let Some(before_apply) = before_apply.take() {
+            before_apply(&rollout_path);
+        }
         let applied = apply_session_changes(&rewrite_changes)?;
         if !rollout_file_matches_provider(&rollout_path, thread_id, target_provider)? {
             let mut deferred = result(
@@ -2847,4 +2868,91 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    #[test]
+    fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
+        let temp = tempdir().unwrap();
+        let home = temp.path().join(".codex");
+        let rollout = home.join("sessions/rollout-mobile.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "mobile",
+                        "model_provider": "openai",
+                        "cwd": "C:/workspace"
+                    }
+                }),
+                json!({"type": "event_msg", "payload": {"type": "user_message"}})
+            ),
+        )
+        .unwrap();
+        let state_db = home.join("state_5.sqlite");
+        let db = Connection::open(&state_db).unwrap();
+        db.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                model_provider TEXT,
+                archived INTEGER,
+                rollout_path TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES ('mobile', 'openai', 0, ?1)",
+            [rollout.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        drop(db);
+
+        let result = run_remote_control_session_finalization_with_before_apply(
+            Some(&home),
+            "mobile",
+            "custom",
+            |path| {
+                let mut file = OpenOptions::new().append(true).open(path).unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type": "event_msg", "payload": {"type": "task_started"}})
+                )
+                .unwrap();
+                file.flush().unwrap();
+            },
+        );
+
+        assert_eq!(result.status, ProviderSyncStatus::Skipped);
+        assert_eq!(result.changed_session_files, 0);
+        assert_eq!(result.sqlite_rows_updated, 0);
+        assert_eq!(result.skipped_locked_rollout_files.len(), 1);
+        assert_eq!(
+            fs::canonicalize(&result.skipped_locked_rollout_files[0]).unwrap(),
+            fs::canonicalize(&rollout).unwrap()
+        );
+        let text = fs::read_to_string(&rollout).unwrap();
+        assert!(text.contains("task_started"));
+        let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(first["payload"]["model_provider"], "openai");
+        let provider: String = Connection::open(&state_db)
+            .unwrap()
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'mobile'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "openai");
+    }
 }
