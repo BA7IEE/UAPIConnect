@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 pub struct ModelCatalogEntry {
     pub slug: String,
     pub display_name: String,
-    /// 来自后缀的窗口值；None 表示该条目无后缀（回落顶层默认）。
+    /// 来自逐模型配置的窗口值；None 表示构建时使用 profile fallback、模型元数据或默认值。
     pub suffix_window: Option<u64>,
 }
 
@@ -69,7 +69,7 @@ pub(crate) fn parse_window_token(token: &str) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
-        .map(|value| value * multiplier)
+        .and_then(|value| value.checked_mul(multiplier))
         .filter(|value| *value > 0)
 }
 
@@ -204,12 +204,12 @@ pub fn model_ui_metadata(slug: &str) -> Option<Value> {
 /// 再覆盖 slug / display_name / description / context_window / max_context_window /
 /// effective_context_window_percent / priority / auto_compact_token_limit 等字段。
 /// 无后缀条目用 fallback_window；fallback 也无时回落 272000（codex 默认）。
-/// auto_compact_token_limit 留 null：codex 内置模型即 null（按比例算，调研第六节）。
+/// 未提供 auto compact fallback 时留 null：codex 内置模型即 null（按比例算，调研第六节）。
 pub fn build_model_catalog_json(
     entries: &[ModelCatalogEntry],
     fallback_window: Option<u64>,
 ) -> String {
-    build_model_catalog_json_with_capabilities(entries, fallback_window, None, None, false)
+    build_model_catalog_json_with_capabilities(entries, fallback_window, None, None, None, false)
 }
 
 /// 使用指定模板（或内置 bundled 模板）构建 catalog。
@@ -219,7 +219,14 @@ pub fn build_model_catalog_json_with_template(
     fallback_window: Option<u64>,
     template: Option<&Value>,
 ) -> String {
-    build_model_catalog_json_with_capabilities(entries, fallback_window, template, None, false)
+    build_model_catalog_json_with_capabilities(
+        entries,
+        fallback_window,
+        None,
+        template,
+        None,
+        false,
+    )
 }
 
 /// 使用显式 provider capability 构建 catalog。
@@ -228,6 +235,7 @@ pub fn build_model_catalog_json_with_template(
 pub(crate) fn build_model_catalog_json_with_capabilities(
     entries: &[ModelCatalogEntry],
     fallback_window: Option<u64>,
+    fallback_auto_compact_limit: Option<u64>,
     template: Option<&Value>,
     use_responses_lite_override: Option<bool>,
     deepseek_metadata: bool,
@@ -262,7 +270,8 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
             if !deepseek_metadata {
                 model["effective_context_window_percent"] = json!(100);
             }
-            model["auto_compact_token_limit"] = Value::Null;
+            model["auto_compact_token_limit"] =
+                fallback_auto_compact_limit.map_or(Value::Null, |limit| json!(limit));
             model["priority"] = json!(1000 + index);
             model["visibility"] = json!("list");
             if !deepseek_metadata {

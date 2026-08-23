@@ -1,14 +1,38 @@
+type ModelWindowsMapParseResult =
+  | { ok: true; map: Record<string, string> }
+  | { ok: false; error: string };
+
+const INVALID_MODEL_WINDOWS_ERROR = "每模型上下文配置不是有效 JSON 对象；原始值尚未改动，请编辑任意模型或窗口后再保存。";
+
+function parseModelWindowsMap(modelWindows: string): ModelWindowsMapParseResult {
+  const serialized = modelWindows.trim();
+  if (!serialized) return { ok: true, map: {} };
+  try {
+    const parsed = JSON.parse(serialized) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ok: false, error: INVALID_MODEL_WINDOWS_ERROR };
+    }
+    const map: Record<string, string> = {};
+    for (const [model, window] of Object.entries(parsed)) {
+      if (typeof window !== "string") {
+        return { ok: false, error: INVALID_MODEL_WINDOWS_ERROR };
+      }
+      map[model] = window;
+    }
+    return { ok: true, map };
+  } catch {
+    return { ok: false, error: INVALID_MODEL_WINDOWS_ERROR };
+  }
+}
+
 /// 把 model_windows JSON map 按 model_list 行顺序转成文本（每行一个窗口，空行表示默认）。
 export function modelWindowsMapToText(modelList: string, modelWindows: string): string {
-  try {
-    const map = JSON.parse(modelWindows || "{}") as Record<string, string>;
-    return modelList
-      .split("\n")
-      .map((line) => map[line.trim()] ?? "")
-      .join("\n");
-  } catch {
-    return "";
-  }
+  const parsed = parseModelWindowsMap(modelWindows);
+  if (!parsed.ok) return "";
+  return modelList
+    .split("\n")
+    .map((line) => parsed.map[line.trim()] ?? "")
+    .join("\n");
 }
 
 /// 把左右 textarea 文本组装成 model_windows JSON map。
@@ -33,6 +57,11 @@ export type ModelWindowRow = {
   imageHandling: ImageHandling;
 };
 
+export type ModelWindowRowsFromProfileResult = {
+  rows: ModelWindowRow[];
+  validationError: string | null;
+};
+
 export function mergeModelWindowRows(
   currentRows: ModelWindowRow[],
   incomingRows: ModelWindowRow[],
@@ -50,13 +79,13 @@ export function mergeModelWindowRows(
   return rows.length ? rows : [{ model: "", window: "", imageHandling: "send-as-is" }];
 }
 
-export function modelWindowRowsFromProfile(modelList: string, modelWindows: string, modelVlm?: string): ModelWindowRow[] {
-  let map: Record<string, string> = {};
-  try {
-    map = JSON.parse(modelWindows || "{}") as Record<string, string>;
-  } catch {
-    map = {};
-  }
+export function modelWindowRowsFromProfile(
+  modelList: string,
+  modelWindows: string,
+  modelVlm?: string,
+): ModelWindowRowsFromProfileResult {
+  const parsedWindows = parseModelWindowsMap(modelWindows);
+  const map = parsedWindows.ok ? parsedWindows.map : {};
   // 解析 modelVlm JSON：`{"model": "vlm"/"strip"}`
   let vlmMap: Record<string, ImageHandling> = {};
   try {
@@ -77,7 +106,10 @@ export function modelWindowRowsFromProfile(modelList: string, modelWindows: stri
     .map((model) => model.trim())
     .filter(Boolean)
     .map((model) => ({ model, window: map[model] ?? "", imageHandling: vlmMap[model] ?? "send-as-is" }));
-  return rows.length ? rows : [{ model: "", window: "", imageHandling: "send-as-is" }];
+  return {
+    rows: rows.length ? rows : [{ model: "", window: "", imageHandling: "send-as-is" }],
+    validationError: parsedWindows.ok ? null : parsedWindows.error,
+  };
 }
 
 export function serializeModelWindowRows(rows: ModelWindowRow[]): { modelList: string; modelWindows: string; modelVlm: string } {

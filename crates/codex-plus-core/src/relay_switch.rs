@@ -21,6 +21,17 @@ pub fn switch_relay_profile_in_home(
     next_settings: BackendSettings,
     previous_active_relay_id: &str,
 ) -> anyhow::Result<RelaySwitchResult> {
+    crate::relay_config::with_live_files_transaction(home, || {
+        switch_relay_profile_in_home_locked(store, home, next_settings, previous_active_relay_id)
+    })
+}
+
+fn switch_relay_profile_in_home_locked(
+    store: &SettingsStore,
+    home: &Path,
+    next_settings: BackendSettings,
+    previous_active_relay_id: &str,
+) -> anyhow::Result<RelaySwitchResult> {
     let mut selected_settings = next_settings;
     if !selected_settings.relay_profiles_enabled {
         anyhow::bail!("供应商配置总开关已关闭，未写入 config.toml / auth.json。");
@@ -28,7 +39,9 @@ pub fn switch_relay_profile_in_home(
     crate::codex_app_state::capture_app_state_snapshot_nonfatal(home, "relay_switch.before");
 
     let original_settings = store.load().unwrap_or_default();
-    let live_snapshot = LiveFilesSnapshot::capture(home).context("读取当前 Codex 实时配置失败")?;
+    let target_profile = selected_settings.active_relay_profile();
+    let live_snapshot = LiveFilesSnapshot::capture(home, &target_profile.id)
+        .context("读取当前 Codex 实时配置失败")?;
     if !previous_active_relay_id.trim().is_empty()
         && previous_active_relay_id != selected_settings.active_relay_id
     {
@@ -71,23 +84,41 @@ pub fn switch_relay_profile_in_home(
 struct LiveFilesSnapshot {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
+    managed_catalog_path: std::path::PathBuf,
+    managed_catalog: Option<Vec<u8>>,
 }
 
 impl LiveFilesSnapshot {
-    fn capture(home: &Path) -> anyhow::Result<Self> {
+    fn capture(home: &Path, target_profile_id: &str) -> anyhow::Result<Self> {
+        let managed_catalog_path = home.join(
+            crate::relay_config::managed_model_catalog_relative_path(target_profile_id),
+        );
         Ok(Self {
             config: read_optional_bytes(&home.join("config.toml"))?,
             auth: read_optional_bytes(&home.join("auth.json"))?,
+            managed_catalog: read_optional_bytes(&managed_catalog_path)?,
+            managed_catalog_path,
         })
     }
 
     fn restore(&self, home: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(home)?;
-        restore_optional_file(&home.join("config.toml"), self.config.as_deref())
-            .context("恢复 config.toml 失败")?;
-        restore_optional_file(&home.join("auth.json"), self.auth.as_deref())
-            .context("恢复 auth.json 失败")?;
-        Ok(())
+        let config_error =
+            restore_optional_file(&home.join("config.toml"), self.config.as_deref()).err();
+        let auth_error =
+            restore_optional_private_file(&home.join("auth.json"), self.auth.as_deref()).err();
+        let catalog_error =
+            restore_optional_file(&self.managed_catalog_path, self.managed_catalog.as_deref())
+                .err();
+        if config_error.is_none() && auth_error.is_none() && catalog_error.is_none() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Codex 实时文件回滚不完整：config.toml={}，auth.json={}，model catalog={}",
+            rollback_status(config_error),
+            rollback_status(auth_error),
+            rollback_status(catalog_error),
+        )
     }
 }
 
@@ -108,6 +139,23 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
             Err(error) => Err(error.into()),
         },
     }
+}
+
+fn restore_optional_private_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result<()> {
+    match contents {
+        Some(contents) => crate::settings::atomic_write_private(path, contents).map_err(Into::into),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
+fn rollback_status(error: Option<anyhow::Error>) -> String {
+    error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "ok".to_string())
 }
 
 fn backfill_profile_before_switch(

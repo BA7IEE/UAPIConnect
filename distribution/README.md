@@ -14,8 +14,10 @@ Rules:
 
 ## Upstream-friendly structure
 
-- The upstream `apps/codex-plus-manager/src/App.tsx` and shared `styles.css` remain untouched.
-- The fixed-provider shell is isolated under `apps/codex-plus-manager/src/uapi/`.
+- The upstream `apps/codex-plus-manager/src/App.tsx` contains only audited
+  per-model catalog integration hooks; the shared `styles.css` remains untouched.
+- The fixed-provider shell and its responsive styling are isolated under
+  `apps/codex-plus-manager/src/uapi/`.
 - Tauri commands are isolated in `src-tauri/src/uapi_commands.rs`.
 - Native Codex page injection is disabled for this edition; model discovery uses
   Codex's native `model_catalog_json` configuration instead.

@@ -1832,6 +1832,7 @@ fn session_index_preview_preserves_relation_only_sqlite_thread_references() {
     assert!(preview.candidates.is_empty());
 }
 
+#[cfg(any(unix, windows))]
 #[test]
 fn session_index_cleanup_write_failure_reports_backup_and_preserves_original() {
     let tmp = tempdir().unwrap();
@@ -1841,14 +1842,46 @@ fn session_index_cleanup_write_failure_reports_backup_and_preserves_original() {
     let original = format!("{}\n", session_index_line(stale_id, "stale"));
     fs::write(home.join("session_index.jsonl"), &original).unwrap();
     let preview = preview_session_index_cleanup(Some(&home)).unwrap();
-    fs::create_dir(home.join("session_index.jsonl.tmp")).unwrap();
 
-    let error = apply_session_index_cleanup(
+    // atomic_write 使用唯一临时文件，不能再靠占用固定的 `.tmp` 名称制造失败。
+    // Unix 上保留可写的锁/备份子目录后收紧 home 目录，Windows 上则允许
+    // 其他读取但拒绝删除共享，使 MoveFileEx 的原子替换稳定失败。
+    #[cfg(unix)]
+    let original_home_mode = {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(home.join("tmp")).unwrap();
+        fs::create_dir_all(home.join("backups_state/provider-sync")).unwrap();
+        let mode = fs::metadata(&home).unwrap().permissions().mode();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+        mode
+    };
+    #[cfg(windows)]
+    let _replace_blocker = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(home.join("session_index.jsonl"))
+            .unwrap()
+    };
+
+    let result = apply_session_index_cleanup(
         Some(&home),
         &preview.snapshot_sha256,
         &[stale_id.to_string()],
-    )
-    .unwrap_err();
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&home, fs::Permissions::from_mode(original_home_mode)).unwrap();
+    }
+
+    let error = result.unwrap_err();
 
     assert!(error.message.contains("原子写入"));
     let backup = error.backup_dir.expect("failure must expose backup");

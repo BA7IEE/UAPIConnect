@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -1591,14 +1593,21 @@ fn normalize_text_config(contents: String) -> String {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with_privacy(path, bytes, false)
+}
+
+/// 原子写入包含凭据的文件，并在 Unix 上从临时文件创建阶段就限制为 `0600`。
+pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_write_with_privacy(path, bytes, true)
+}
+
+fn atomic_write_with_privacy(path: &Path, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    let temp_path = temp_path_for(path);
-    fs::write(&temp_path, bytes)
-        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+    let temp_path = write_atomic_temp(path, bytes, private)?;
     if let Err(error) = replace_file(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(error).with_context(|| {
@@ -1610,6 +1619,63 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         });
     }
     Ok(())
+}
+
+fn write_atomic_temp(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("file"));
+
+    for _ in 0..128 {
+        let mut temp_name = OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let temp_path = parent.join(temp_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+
+        let mut file = match options.open(&temp_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to create atomic temp file for {}", path.display())
+                });
+            }
+        };
+        if let Err(error) = file.write_all(bytes) {
+            drop(file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(error)
+                .with_context(|| format!("failed to write temp file {}", temp_path.display()));
+        }
+        drop(file);
+        return Ok(temp_path);
+    }
+
+    anyhow::bail!(
+        "failed to allocate a unique atomic temp file for {}",
+        path.display()
+    )
 }
 
 #[cfg(not(windows))]
@@ -1646,16 +1712,6 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn temp_path_for(path: &Path) -> PathBuf {
-    let mut temp_path = path.to_path_buf();
-    let extension = path.extension().and_then(|value| value.to_str());
-    temp_path.set_extension(match extension {
-        Some(extension) => format!("{extension}.tmp"),
-        None => "tmp".to_string(),
-    });
-    temp_path
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1679,11 +1735,68 @@ mod tests {
         let dir = temp_dir();
         let path = dir.join("settings.json");
         std::fs::write(&path, b"old").unwrap();
+        let legacy_temp_path = dir.join("settings.json.tmp");
+        std::fs::create_dir(&legacy_temp_path).unwrap();
 
         atomic_write(&path, b"new").unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        assert!(!dir.join("settings.json.tmp").exists());
+        assert!(legacy_temp_path.is_dir());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_never_share_a_temp_file_or_publish_partial_bytes() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let payloads = Arc::new(
+            (0..12)
+                .map(|index| format!("writer-{index:02}:{}", "x".repeat(32 * 1024)).into_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let barrier = Arc::new(Barrier::new(payloads.len()));
+        let mut writers = Vec::new();
+        for index in 0..payloads.len() {
+            let path = path.clone();
+            let payloads = Arc::clone(&payloads);
+            let barrier = Arc::clone(&barrier);
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    atomic_write(&path, &payloads[index]).unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let published = std::fs::read(&path).unwrap();
+        assert!(payloads.iter().any(|payload| payload == &published));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_private_keeps_target_and_temp_creation_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let path = dir.join("auth.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_write_private(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!dir.join("auth.json.tmp").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2514,7 +2627,10 @@ experimental_bearer_token = "sk-existing""#
             .unwrap();
 
         assert!(updated.weixin_connect_enabled);
-        assert_eq!(updated.weixin_connect_base_url, "https://ilink.example.test");
+        assert_eq!(
+            updated.weixin_connect_base_url,
+            "https://ilink.example.test"
+        );
         assert_eq!(updated.weixin_connect_token, "token");
         assert_eq!(updated.weixin_connect_account_id, "bot-1");
         assert_eq!(updated.weixin_connect_allow_from, "user@im.wechat");

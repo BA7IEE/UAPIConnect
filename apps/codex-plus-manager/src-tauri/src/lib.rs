@@ -41,8 +41,8 @@ pub fn run() {
             serde_json::json!({ "message": error.to_string() }),
         );
     }
-    let show_update = codex_plus_core::distribution::UPDATES_ENABLED
-        && commands::startup_should_show_update();
+    let show_update =
+        codex_plus_core::distribution::UPDATES_ENABLED && commands::startup_should_show_update();
     let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -76,6 +76,7 @@ pub fn run() {
             uapi_commands::uapi_validate_key,
             uapi_commands::uapi_configure,
             uapi_commands::uapi_refresh_models,
+            uapi_commands::uapi_switch_mode,
             uapi_commands::uapi_diagnostics,
             commands::startup_options,
             commands::load_overview,

@@ -1,7 +1,5 @@
 use codex_plus_core::models::{DeleteStatus, SessionRef};
-use codex_plus_data::{
-    BackupStore, SQLiteStorageAdapter, delete_local_from_paths,
-};
+use codex_plus_data::{BackupStore, SQLiteStorageAdapter, delete_local_from_paths};
 use rusqlite::Connection;
 use serde_json::json;
 use std::fs;

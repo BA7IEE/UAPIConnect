@@ -200,6 +200,17 @@
   font-size: 11px;
 }
 
+@media (max-width: 1080px) {
+  .uapi-shell .brand-copy,
+  .uapi-shell .uapi-nav-copy {
+    display: none;
+  }
+
+  .uapi-shell .brand-title::after {
+    content: none;
+  }
+}
+
 @media (max-width: 900px) {
   .uapi-hero-content {
     grid-template-columns: auto minmax(0, 1fr);

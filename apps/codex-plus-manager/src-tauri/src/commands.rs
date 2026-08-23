@@ -617,12 +617,8 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
         },
         Err(error) => {
             let message = format!("重启 Codex++ 失败：{error}");
-            let _ = save_requested_launch_status(
-                &request,
-                "failed",
-                &message,
-                launch_started_at_ms,
-            );
+            let _ =
+                save_requested_launch_status(&request, "failed", &message, launch_started_at_ms);
             failed(
                 &message,
                 json!({
@@ -646,7 +642,8 @@ where
     F: FnOnce(&LaunchRequest) -> anyhow::Result<()>,
 {
     let snapshot = if let Some(settings) = settings {
-        let snapshot = RelayLiveSnapshot::capture(home)?;
+        let target_profile = settings.active_relay_profile();
+        let snapshot = RelayLiveSnapshot::capture(home, &target_profile.id)?;
         if let Err(error) = sync_active_relay_to_home(settings, home) {
             if let Err(restore_error) = snapshot.restore(home) {
                 anyhow::bail!("同步当前供应商失败：{error}；回滚 live 配置也失败：{restore_error}");
@@ -673,13 +670,20 @@ where
 struct RelayLiveSnapshot {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
+    managed_catalog_path: std::path::PathBuf,
+    managed_catalog: Option<Vec<u8>>,
 }
 
 impl RelayLiveSnapshot {
-    fn capture(home: &Path) -> anyhow::Result<Self> {
+    fn capture(home: &Path, target_profile_id: &str) -> anyhow::Result<Self> {
+        let managed_catalog_path = home.join(
+            codex_plus_core::relay_config::managed_model_catalog_relative_path(target_profile_id),
+        );
         Ok(Self {
             config: read_optional_file_bytes(&home.join("config.toml"))?,
             auth: read_optional_file_bytes(&home.join("auth.json"))?,
+            managed_catalog: read_optional_file_bytes(&managed_catalog_path)?,
+            managed_catalog_path,
         })
     }
 
@@ -687,6 +691,7 @@ impl RelayLiveSnapshot {
         std::fs::create_dir_all(home)?;
         restore_optional_file_bytes(&home.join("config.toml"), self.config.as_deref())?;
         restore_optional_file_bytes(&home.join("auth.json"), self.auth.as_deref())?;
+        restore_optional_file_bytes(&self.managed_catalog_path, self.managed_catalog.as_deref())?;
         Ok(())
     }
 }
@@ -820,12 +825,8 @@ fn spawn_codex_plus_launch(request: LaunchRequest, accepted_message: &str) -> Co
         },
         Err(error) => {
             let message = format!("启动静默入口失败：{error}");
-            let _ = save_requested_launch_status(
-                &request,
-                "failed",
-                &message,
-                launch_started_at_ms,
-            );
+            let _ =
+                save_requested_launch_status(&request, "failed", &message, launch_started_at_ms);
             failed(
                 &message,
                 json!({
@@ -901,15 +902,11 @@ pub async fn weixin_connect_qr_start(
     base_url: String,
     route_tag: String,
 ) -> CommandResult<WeixinQrPayload> {
-    match codex_plus_core::connect::weixin::WeixinClient::fetch_qr_code(
-        &base_url,
-        &route_tag,
-    )
-    .await
+    match codex_plus_core::connect::weixin::WeixinClient::fetch_qr_code(&base_url, &route_tag).await
     {
         Ok(qr) => {
-            let qr_svg = codex_plus_core::connect::weixin::render_qr_svg(&qr.qr_content)
-                .unwrap_or_default();
+            let qr_svg =
+                codex_plus_core::connect::weixin::render_qr_svg(&qr.qr_content).unwrap_or_default();
             let session = WeixinQrSession {
                 base_url: if base_url.trim().is_empty() {
                     codex_plus_core::connect::DEFAULT_WEIXIN_BASE_URL.to_string()
@@ -955,7 +952,10 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
         })
     });
     let Some(session) = session else {
-        return failed("当前没有待确认的微信二维码。", empty_weixin_qr_payload("missing"));
+        return failed(
+            "当前没有待确认的微信二维码。",
+            empty_weixin_qr_payload("missing"),
+        );
     };
 
     let result = codex_plus_core::connect::weixin::WeixinClient::poll_qr_status(
@@ -1000,7 +1000,8 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
         settings.weixin_connect_token = qr_status.bot_token;
         settings.weixin_connect_account_id = qr_status.ilink_bot_id.clone();
         if !qr_status.baseurl.trim().is_empty() {
-            settings.weixin_connect_base_url = qr_status.baseurl.trim().trim_end_matches('/').to_string();
+            settings.weixin_connect_base_url =
+                qr_status.baseurl.trim().trim_end_matches('/').to_string();
         } else {
             settings.weixin_connect_base_url = session.base_url.clone();
         }
@@ -1070,11 +1071,17 @@ pub fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::WeixinC
     }
     settings.weixin_connect_enabled = true;
     if let Err(error) = store.save(&settings) {
-        return failed(&format!("保存微信连接设置失败：{error}"), current_weixin_status());
+        return failed(
+            &format!("保存微信连接设置失败：{error}"),
+            current_weixin_status(),
+        );
     }
     match spawn_weixin_connect(settings) {
         Ok(status) => ok("微信连接正在启动。", status),
-        Err(error) => failed(&format!("启动微信连接失败：{error}"), current_weixin_status()),
+        Err(error) => failed(
+            &format!("启动微信连接失败：{error}"),
+            current_weixin_status(),
+        ),
     }
 }
 
@@ -1152,12 +1159,9 @@ fn spawn_weixin_connect(
     let task_status = Arc::clone(&status);
     let task_stop = Arc::clone(&stop);
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = codex_plus_core::connect::run_weixin_connect(
-            config,
-            stop,
-            Arc::clone(&task_status),
-        )
-        .await
+        if let Err(error) =
+            codex_plus_core::connect::run_weixin_connect(config, stop, Arc::clone(&task_status))
+                .await
             && let Ok(mut current) = task_status.lock()
         {
             current.state = "error".to_string();
@@ -5746,11 +5750,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("config.toml"), "model = \"old\"\n").unwrap();
         std::fs::write(temp.path().join("auth.json"), "{\"old\":true}\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("model-catalogs")).unwrap();
+        let catalog_path = temp.path().join("model-catalogs").join("source.json");
+        let original_catalog = "{\"models\":[{\"slug\":\"old\"}]}\n";
+        std::fs::write(&catalog_path, original_catalog).unwrap();
+        let mut settings = routed_pure_api_settings();
+        settings.relay_profiles[0].model = "custom-model".to_string();
+        settings.relay_profiles[0].model_list = "custom-model".to_string();
+        settings.relay_profiles[0].model_windows = r#"{"custom-model":"1M"}"#.to_string();
 
         let result = restart_codex_plus_after_stop(
             &launch_request(true),
             temp.path(),
-            Some(&routed_pure_api_settings()),
+            Some(&settings),
             |_| anyhow::bail!("synthetic spawn failure"),
         );
 
@@ -5762,6 +5774,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
             "{\"old\":true}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(catalog_path).unwrap(),
+            original_catalog
         );
     }
 

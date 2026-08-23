@@ -316,6 +316,9 @@ where
                 );
             }
         }
+        if crate::distribution::FIXED_PROVIDER_EDITION {
+            hooks.apply_active_relay_profile(&settings).await?;
+        }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
         if protocol_proxy_enabled {
@@ -550,6 +553,9 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn apply_active_relay_profile(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        if crate::distribution::FIXED_PROVIDER_EDITION {
+            return crate::uapi::apply_active_connection_profile();
+        }
         if !settings.relay_profiles_enabled {
             return Ok(());
         }

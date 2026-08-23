@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import type { RelayProfile } from "./App.tsx";
 import {
@@ -87,8 +88,10 @@ describe("model-windows helpers", () => {
   });
 
   it("modelWindowRowsFromProfile 把模型和窗口合成同一组行", () => {
+    const result = modelWindowRowsFromProfile("a\nb\nc", '{"a":"1M","c":"200K"}');
+    assert.strictEqual(result.validationError, null);
     assert.deepStrictEqual(
-      modelWindowRowsFromProfile("a\nb\nc", '{"a":"1M","c":"200K"}'),
+      result.rows,
       [
         { model: "a", window: "1M", imageHandling: "send-as-is" },
         { model: "b", window: "", imageHandling: "send-as-is" },
@@ -98,14 +101,41 @@ describe("model-windows helpers", () => {
   });
 
   it("modelWindowRowsFromProfile 解析 modelVlm 标记", () => {
+    const result = modelWindowRowsFromProfile("a\nb\nc", '{}', '{"a":"vlm","b":"strip"}');
+    assert.strictEqual(result.validationError, null);
     assert.deepStrictEqual(
-      modelWindowRowsFromProfile("a\nb\nc", '{}', '{"a":"vlm","b":"strip"}'),
+      result.rows,
       [
         { model: "a", window: "", imageHandling: "vlm" },
         { model: "b", window: "", imageHandling: "strip" },
         { model: "c", window: "", imageHandling: "send-as-is" },
       ],
     );
+  });
+
+  it("modelWindowRowsFromProfile 对损坏 JSON 显式返回错误且不伪装成合法空配置", () => {
+    const result = modelWindowRowsFromProfile("a\nb", "not-json");
+    assert.ok(result.validationError?.includes("不是有效 JSON 对象"));
+    assert.deepStrictEqual(result.rows, [
+      { model: "a", window: "", imageHandling: "send-as-is" },
+      { model: "b", window: "", imageHandling: "send-as-is" },
+    ]);
+  });
+
+  it("modelWindowRowsFromProfile 保持空值和空对象兼容", () => {
+    for (const serialized of ["", "  ", "{}"]) {
+      const result = modelWindowRowsFromProfile("a", serialized);
+      assert.strictEqual(result.validationError, null);
+      assert.deepStrictEqual(result.rows, [
+        { model: "a", window: "", imageHandling: "send-as-is" },
+      ]);
+    }
+  });
+
+  it("modelWindowRowsFromProfile 拒绝非对象及非字符串窗口值", () => {
+    for (const serialized of ["[]", "null", '{"a":1000000}']) {
+      assert.ok(modelWindowRowsFromProfile("a", serialized).validationError);
+    }
   });
 
   it("serializeModelWindowRows 从行控件生成 modelList、modelWindows 和 modelVlm", () => {
@@ -141,5 +171,13 @@ describe("model-windows helpers", () => {
         { model: "deepseek-v4-pro", window: "", imageHandling: "vlm" },
       ],
     );
+  });
+
+  it("供应商编辑器在损坏 modelWindows 时阻止保存，只有显式编辑行才解除错误", async () => {
+    const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    assert.match(source, /const validationError = modelWindowsValidationError \|\|/);
+    assert.match(source, /if \(validationError\) return;/);
+    assert.match(source, /setModelWindowState\(\{ rows, validationError: null \}\)/);
+    assert.match(source, /<p className="field-hint" role="alert">\{modelWindowsValidationError\}<\/p>/);
   });
 });

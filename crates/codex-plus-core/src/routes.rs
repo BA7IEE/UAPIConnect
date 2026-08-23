@@ -584,7 +584,6 @@ impl BridgeDataService for UnavailableDataService {
     ) -> anyhow::Result<Option<SessionRef>> {
         Ok(None)
     }
-
 }
 
 fn settings_payload_value(

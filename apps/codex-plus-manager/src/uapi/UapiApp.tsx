@@ -26,12 +26,14 @@ import { useCallback, useEffect, useMemo, useState, type ChangeEvent } from "rea
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { canLaunch } from "../uapi-launch-policy";
 import { distribution } from "./distribution";
 import "./uapi.css";
 
 type Route = "overview" | "connection" | "maintenance" | "about";
 type Theme = "dark" | "light";
-type BusyAction = "validate" | "configure" | "refresh" | "launch" | "repair" | "diagnostics" | null;
+type BusyAction = "validate" | "configure" | "refresh" | "status" | "switchMode" | "launch" | "repair" | "diagnostics" | null;
+type UapiConnectionMode = "uapi" | "official";
 
 type CommandResult<T> = T & {
   status: string;
@@ -67,6 +69,13 @@ type OverviewResult = CommandResult<{
 type UapiStatus = {
   configured: boolean;
   active: boolean;
+  connectionMode: UapiConnectionMode;
+  uapiReady: boolean;
+  officialLoginSaved: boolean;
+  officialAuthenticated: boolean;
+  officialAccountLabel: string | null;
+  credentialStoreAvailable: boolean;
+  credentialStoreMessage: string;
   providerId: string;
   baseUrl: string;
   currentModel: string;
@@ -97,6 +106,16 @@ type UapiApplyResult = CommandResult<{
   filteredModels: string[];
   backupPath: string | null;
   configPath: string;
+}>;
+
+type UapiModeSwitchResult = CommandResult<{
+  connectionMode: UapiConnectionMode;
+  configured: boolean;
+  officialLoginSaved: boolean;
+  officialAuthenticated: boolean;
+  backupPath: string | null;
+  configPath: string;
+  restartRequired: boolean;
 }>;
 
 type DiagnosticsResult = CommandResult<{ report: string }>;
@@ -146,7 +165,7 @@ export function UapiApp() {
     setOverview(overviewResult);
     setStatus(statusResult);
     setVersion(versionResult.version);
-    if (!statusResult.configured && route === "overview") {
+    if (!canLaunch(statusResult) && route === "overview") {
       setRoute("connection");
     }
   }, [route]);
@@ -169,6 +188,19 @@ export function UapiApp() {
       setBusy(null);
     }
   }, []);
+
+  const refreshStatus = useCallback(async () => {
+    setBusy("status");
+    setNotice(null);
+    try {
+      await refreshState();
+      setNotice({ kind: "ok", text: "状态已刷新。" });
+    } catch (error) {
+      setNotice({ kind: "error", text: `状态刷新失败：${friendlyError(error)}` });
+    } finally {
+      setBusy(null);
+    }
+  }, [refreshState]);
 
   const validateKey = useCallback(async () => {
     const result = await run("validate", async () =>
@@ -217,16 +249,52 @@ export function UapiApp() {
     await refreshState();
   }, [refreshState, run]);
 
-  const launch = useCallback(async () => {
-    if (!status?.configured) {
+  const switchMode = useCallback(async (mode: UapiConnectionMode) => {
+    const result = await run("switchMode", async () =>
+      invoke<UapiModeSwitchResult>("uapi_switch_mode", { request: { mode } }),
+    );
+    if (!result) return;
+    if (result.status !== "ok") {
+      setNotice({ kind: "error", text: result.message });
+      return;
+    }
+    setDiscovery(null);
+    try {
+      await refreshState();
+    } catch (error) {
+      setNotice({ kind: "error", text: `模式已切换，但状态刷新失败：${friendlyError(error)}` });
+      return;
+    }
+    if (mode === "official" && !result.officialAuthenticated) {
+      setNotice({ kind: "info", text: "已切到官方订阅。请启动 Codex 并按原生流程登录 ChatGPT。" });
+      return;
+    }
+    if (mode === "uapi" && !result.configured) {
       setRoute("connection");
-      setNotice({ kind: "info", text: "请先填写服务密钥。" });
+      setNotice({ kind: "info", text: "已切回 U-API Connect，请填写服务密钥完成配置。" });
+      return;
+    }
+    setNotice({
+      kind: "ok",
+      text: mode === "official" ? "已切到官方订阅，重启或启动 Codex 后生效。" : "已切回 U-API Connect，重启或启动 Codex 后生效。",
+    });
+  }, [refreshState, run]);
+
+  const launch = useCallback(async () => {
+    if (!canLaunch(status)) {
+      setRoute("connection");
+      setNotice({
+        kind: "info",
+        text: "请先填写服务密钥。",
+      });
       return;
     }
     const result = await run("launch", async () => {
-      const refreshed = await invoke<UapiApplyResult>("uapi_refresh_models");
-      if (refreshed.status !== "ok") {
-        setNotice({ kind: "info", text: `模型刷新失败，将使用上次有效配置：${refreshed.message}` });
+      if (status?.connectionMode === "uapi") {
+        const refreshed = await invoke<UapiApplyResult>("uapi_refresh_models");
+        if (refreshed.status !== "ok") {
+          setNotice({ kind: "info", text: `模型刷新失败，将使用上次有效配置：${refreshed.message}` });
+        }
       }
       return invoke<CommandResult<Record<string, unknown>>>("launch_codex_plus", {
         request: {
@@ -243,7 +311,7 @@ export function UapiApp() {
       text: result.message,
     });
     window.setTimeout(() => void refreshState(), 1200);
-  }, [refreshState, run, status?.configured]);
+  }, [refreshState, run, status]);
 
   const repair = useCallback(async () => {
     const result = await run("repair", async () => invoke<CommandResult<Record<string, unknown>>>("repair_shortcuts"));
@@ -266,7 +334,7 @@ export function UapiApp() {
   const activeNav = useMemo(() => navItems.find((item) => item.id === route) ?? navItems[0], [route]);
 
   return (
-    <div className={`shell ${theme}`}>
+    <div className={`shell uapi-shell ${theme}`}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">U</div>
@@ -282,12 +350,14 @@ export function UapiApp() {
             const Icon = item.icon;
             return (
               <button
+                aria-label={item.label}
                 className={`nav-item ${route === item.id ? "active" : ""}`}
                 key={item.id}
                 onClick={() => {
                   setRoute(item.id);
                   setNotice(null);
                 }}
+                title={item.label}
                 type="button"
               >
                 <span className="nav-icon"><Icon className="h-4 w-4" /></span>
@@ -330,7 +400,7 @@ export function UapiApp() {
               busy={busy}
               onConfigure={() => setRoute("connection")}
               onLaunch={launch}
-              onRefresh={refreshState}
+              onRefresh={refreshStatus}
               overview={overview}
               status={status}
             />
@@ -343,6 +413,7 @@ export function UapiApp() {
               onApiKey={setApiKey}
               onConfigure={configure}
               onRefreshModels={refreshModels}
+              onSwitchMode={switchMode}
               onToggleKey={() => setShowKey((current) => !current)}
               onValidate={validateKey}
               showKey={showKey}
@@ -353,7 +424,7 @@ export function UapiApp() {
             <MaintenanceScreen
               busy={busy}
               onCopyDiagnostics={copyDiagnostics}
-              onRefresh={refreshState}
+              onRefresh={refreshStatus}
               onRefreshModels={refreshModels}
               onRepair={repair}
               overview={overview}
@@ -388,18 +459,26 @@ function OverviewScreen({
   onRefresh: () => Promise<void>;
 }) {
   const codexReady = overview?.codex_app.status === "found";
+  const usingOfficial = status?.connectionMode === "official";
+  const launchAllowed = canLaunch(status);
   return (
     <div className="uapi-stack">
       <Card className="panel uapi-hero-panel">
         <CardContent className="uapi-hero-content">
           <div className="uapi-hero-icon"><Network className="h-6 w-6" /></div>
           <div className="uapi-hero-copy">
-            <span className="eyebrow">固定服务 · 动态模型</span>
-            <h2>Codex 已接入 U-API Connect</h2>
-            <p>中转地址已内置，模型会按当前密钥权限自动同步，并过滤不兼容 Responses API 的模型。</p>
+            <span className="eyebrow">{usingOfficial ? "官方订阅 · 临时模式" : "固定服务 · 动态模型"}</span>
+            <h2>{usingOfficial
+              ? status?.officialAuthenticated ? "Codex 正使用官方订阅" : "Codex 已切到官方订阅模式"
+              : "Codex 已接入 U-API Connect"}</h2>
+            <p>{usingOfficial
+              ? status?.officialAuthenticated
+                ? "官方登录已就绪；完成测试后可随时切回默认服务。"
+                : "启动 Codex 后可按原生流程登录 ChatGPT；完成测试后可随时切回默认服务。"
+              : "中转地址已内置，模型会按当前密钥权限自动同步。"}</p>
           </div>
           <div className="uapi-hero-actions">
-            {status?.configured ? (
+            {launchAllowed ? (
               <Button disabled={busy !== null} onClick={() => void onLaunch()}>
                 <Play className="h-4 w-4" />启动 Codex
               </Button>
@@ -423,24 +502,26 @@ function OverviewScreen({
               title="Codex Desktop"
             />
             <HealthItem
-              detail={status?.configured ? `密钥 ${status.apiKeyMasked || "已保存"}` : "尚未配置服务密钥"}
-              ok={Boolean(status?.configured)}
-              title="AI 服务"
+              detail={usingOfficial
+                ? status?.officialAuthenticated ? "官方订阅已就绪" : "尚未登录，启动 Codex 后完成登录"
+                : status?.configured ? `密钥 ${status.apiKeyMasked || "已保存"}` : "尚未配置服务密钥"}
+              ok={usingOfficial ? Boolean(status?.officialAuthenticated) : Boolean(status?.configured)}
+              title={usingOfficial ? "官方订阅" : "AI 服务"}
             />
             <HealthItem
-              detail={status?.modelCount ? `${status.modelCount} 个兼容模型` : "尚未同步模型"}
-              ok={Boolean(status?.modelCount)}
+              detail={usingOfficial ? "由 Codex 官方账号管理" : status?.modelCount ? `${status.modelCount} 个兼容模型` : "尚未同步模型"}
+              ok={usingOfficial || Boolean(status?.modelCount)}
               title="模型目录"
             />
             <HealthItem
-              detail={status?.currentModel || "尚未选择"}
-              ok={Boolean(status?.currentModel)}
+              detail={usingOfficial ? "由 Codex 自动选择" : status?.currentModel || "尚未选择"}
+              ok={usingOfficial || Boolean(status?.currentModel)}
               title="当前模型"
             />
           </div>
           <div className="toolbar">
-            <Button onClick={() => void onRefresh()} variant="secondary">
-              <RefreshCw className="h-4 w-4" />刷新状态
+            <Button disabled={busy !== null} onClick={() => void onRefresh()} variant="outline">
+              <RefreshCw className="h-4 w-4" />{busy === "status" ? "正在刷新…" : "刷新状态"}
             </Button>
             <Button onClick={onConfigure} variant="outline">
               <Settings2 className="h-4 w-4" />连接设置
@@ -476,6 +557,7 @@ function ConnectionScreen({
   onValidate,
   onConfigure,
   onRefreshModels,
+  onSwitchMode,
 }: {
   apiKey: string;
   showKey: boolean;
@@ -487,9 +569,52 @@ function ConnectionScreen({
   onValidate: () => Promise<void>;
   onConfigure: () => Promise<void>;
   onRefreshModels: () => Promise<void>;
+  onSwitchMode: (mode: UapiConnectionMode) => Promise<void>;
 }) {
   return (
     <div className="uapi-stack">
+      <Card className="panel">
+        <CardHeader>
+          <CardTitle>使用模式</CardTitle>
+          <CardDescription>默认使用 U-API Connect；官方订阅仅作为临时开发、测试或自用通道。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="status-table">
+            <StatusRow
+              label="当前模式"
+              value={status?.connectionMode === "official" ? "官方订阅" : "U-API Connect（默认）"}
+            />
+            <StatusRow
+              label="官方登录"
+              value={status?.officialAuthenticated
+                ? status.officialAccountLabel || (status.officialLoginSaved ? "已安全保存" : "当前已登录")
+                : status?.connectionMode === "official" ? "尚未登录，可启动 Codex 完成登录" : "尚未登录"}
+            />
+            <StatusRow label="凭证保管" value={status?.credentialStoreMessage || "正在检查系统凭证库"} />
+          </div>
+          <div className="toolbar">
+            {status?.connectionMode === "official" ? (
+              <Button
+                disabled={!status || !status.credentialStoreAvailable || busy !== null}
+                onClick={() => void onSwitchMode("uapi")}
+              >
+                <Network className="h-4 w-4" />
+                {busy === "switchMode" ? "正在切换…" : "切回 U-API Connect"}
+              </Button>
+            ) : (
+              <Button
+                disabled={!status || !status.credentialStoreAvailable || busy !== null}
+                onClick={() => void onSwitchMode("official")}
+                variant="outline"
+              >
+                <ShieldCheck className="h-4 w-4" />
+                {busy === "switchMode" ? "正在切换…" : "临时使用官方订阅"}
+              </Button>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
       <Card className="panel">
         <CardHeader>
           <CardTitle>服务连接</CardTitle>
@@ -538,7 +663,7 @@ function ConnectionScreen({
       <Card className="panel">
         <CardHeader>
           <CardTitle>模型同步</CardTitle>
-          <CardDescription>只同步明确支持 Responses API 的文本模型。</CardDescription>
+          <CardDescription>同步可用文本模型；默认优先当前最强的 GPT，其他模型仍完整保留。</CardDescription>
         </CardHeader>
         <CardContent>
           <div className="status-table">
@@ -570,6 +695,7 @@ function MaintenanceScreen({
   onRepair: () => Promise<void>;
   onCopyDiagnostics: () => Promise<void>;
 }) {
+  const usingOfficial = status?.connectionMode === "official";
   return (
     <div className="uapi-stack">
       <Card className="panel">
@@ -580,18 +706,22 @@ function MaintenanceScreen({
         <CardContent>
           <div className="health-grid uapi-health-grid">
             <HealthItem detail={overview?.codex_app.path || "未检测到"} ok={overview?.codex_app.status === "found"} title="Codex 安装" />
-            <HealthItem detail={status?.configured ? "配置完整" : "需要重新配置"} ok={Boolean(status?.configured)} title="本地配置" />
-            <HealthItem detail={status?.active ? "受管 Provider 已激活" : "未激活"} ok={Boolean(status?.active)} title="服务路由" />
-            <HealthItem detail={status?.modelCount ? `${status.modelCount} 个` : "未生成"} ok={Boolean(status?.modelCount)} title="模型目录" />
+            <HealthItem
+              detail={usingOfficial ? status?.officialAuthenticated ? "官方登录已就绪" : "等待官方登录" : status?.configured ? "配置完整" : "需要重新配置"}
+              ok={usingOfficial ? Boolean(status?.officialAuthenticated) : Boolean(status?.configured)}
+              title="本地配置"
+            />
+            <HealthItem detail={usingOfficial ? "官方订阅" : status?.active ? "受管 Provider 已激活" : "未激活"} ok={usingOfficial || Boolean(status?.active)} title="服务路由" />
+            <HealthItem detail={usingOfficial ? "官方管理" : status?.modelCount ? `${status.modelCount} 个` : "未生成"} ok={usingOfficial || Boolean(status?.modelCount)} title="模型目录" />
           </div>
           <div className="toolbar">
             <Button disabled={busy !== null} onClick={() => void onRefresh()}>
-              <Stethoscope className="h-4 w-4" />一键检查
+              <Stethoscope className="h-4 w-4" />{busy === "status" ? "正在检查…" : "一键检查"}
             </Button>
             <Button disabled={busy !== null} onClick={() => void onRepair()} variant="secondary">
               <Wrench className="h-4 w-4" />修复入口
             </Button>
-            <Button disabled={!status?.configured || busy !== null} onClick={() => void onRefreshModels()} variant="secondary">
+            <Button disabled={usingOfficial || !status?.configured || busy !== null} onClick={() => void onRefreshModels()} variant="secondary">
               <RefreshCw className="h-4 w-4" />重建模型目录
             </Button>
             <Button disabled={busy !== null} onClick={() => void onCopyDiagnostics()} variant="outline">

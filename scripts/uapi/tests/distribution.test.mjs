@@ -51,7 +51,7 @@ test("Rust policy mirrors the public manifest", () => {
 });
 
 test("managed integration is dynamic and provider identifiers stay paired", () => {
-  assert.match(managedIntegration, /format!\("\{\}\/models"/);
+  assert.match(managedIntegration, /format!\(\s*"\{\}\/models"/);
   assert.match(managedIntegration, /supported_endpoint_types/);
   assert.match(managedIntegration, /openai-response/);
   assert.match(managedIntegration, /\[model_providers\.\{\}\]/);

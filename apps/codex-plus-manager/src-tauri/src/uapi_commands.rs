@@ -23,6 +23,12 @@ pub struct UapiKeyRequest {
     pub api_key: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UapiModeRequest {
+    pub mode: codex_plus_core::uapi::UapiConnectionMode,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticsPayload {
     pub report: String,
@@ -95,6 +101,16 @@ pub async fn uapi_refresh_models() -> CommandResult<codex_plus_core::uapi::UapiA
 }
 
 #[tauri::command]
+pub fn uapi_switch_mode(
+    request: UapiModeRequest,
+) -> CommandResult<codex_plus_core::uapi::UapiModeSwitchResult> {
+    match codex_plus_core::uapi::switch_connection_mode(request.mode) {
+        Ok(result) => ok("连接模式已切换。", result),
+        Err(error) => failed(&error.to_string(), empty_mode_switch_result(request.mode)),
+    }
+}
+
+#[tauri::command]
 pub fn uapi_diagnostics() -> CommandResult<DiagnosticsPayload> {
     let settings = codex_plus_core::settings::SettingsStore::default()
         .load()
@@ -141,5 +157,20 @@ fn empty_apply_result() -> codex_plus_core::uapi::UapiApplyResult {
         filtered_models: Vec::new(),
         backup_path: None,
         config_path: codex_plus_core::uapi::status().config_path,
+    }
+}
+
+fn empty_mode_switch_result(
+    mode: codex_plus_core::uapi::UapiConnectionMode,
+) -> codex_plus_core::uapi::UapiModeSwitchResult {
+    let status = codex_plus_core::uapi::status();
+    codex_plus_core::uapi::UapiModeSwitchResult {
+        connection_mode: mode,
+        configured: status.configured,
+        official_login_saved: status.official_login_saved,
+        official_authenticated: status.official_authenticated,
+        backup_path: None,
+        config_path: status.config_path,
+        restart_required: false,
     }
 }

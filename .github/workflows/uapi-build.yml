@@ -36,6 +36,8 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    env:
+      UAPI_CONNECT_DISTRIBUTION: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,6 +87,110 @@ jobs:
           Push-Location scripts/uapi/installer/windows
           & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" UAPIConnect.nsi
           Pop-Location
+      - name: Smoke test installer lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Get-ChildItem "dist/uapi/windows/UAPIConnect-*-windows-x64-setup.exe" |
+            Select-Object -First 1
+          if (-not $installer) { throw "Windows installer was not produced" }
+
+          $installDir = Join-Path $env:LOCALAPPDATA "Programs\U-API Connect"
+          $launcher = Join-Path $installDir "codex-plus-plus.exe"
+          $manager = Join-Path $installDir "codex-plus-plus-manager.exe"
+          $uninstaller = Join-Path $installDir "uninstall.exe"
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          $programs = [Environment]::GetFolderPath("Programs")
+          $desktopLauncher = Join-Path $desktop "U-API Connect.lnk"
+          $desktopManager = Join-Path $desktop "U-API Connect 设置.lnk"
+          $startMenuDir = Join-Path $programs "U-API Connect"
+          $startMenuLauncher = Join-Path $startMenuDir "U-API Connect.lnk"
+          $startMenuManager = Join-Path $startMenuDir "U-API Connect 设置.lnk"
+          $startMenuUninstaller = Join-Path $startMenuDir "卸载 U-API Connect.lnk"
+          $productKey = "Registry::HKEY_CURRENT_USER\Software\UAPIConnect"
+          $uninstallKey = "Registry::HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect"
+          $protocolRoot = "Registry::HKEY_CURRENT_USER\Software\Classes\uapiconnect"
+          $protocolKey = "Registry::HKEY_CURRENT_USER\Software\Classes\uapiconnect\shell\open\command"
+
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer exited with $($install.ExitCode)" }
+
+          $requiredPaths = @(
+            $launcher,
+            $manager,
+            $uninstaller,
+            $desktopLauncher,
+            $desktopManager,
+            $startMenuLauncher,
+            $startMenuManager,
+            $startMenuUninstaller,
+            $productKey,
+            $uninstallKey,
+            $protocolRoot,
+            $protocolKey
+          )
+          $missing = $requiredPaths | Where-Object { -not (Test-Path -LiteralPath $_) }
+          if ($missing) { throw "Installer omitted: $($missing -join ', ')" }
+
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcutTargets = @(
+            [pscustomobject]@{ Path = $desktopLauncher; Target = $launcher }
+            [pscustomobject]@{ Path = $desktopManager; Target = $manager }
+            [pscustomobject]@{ Path = $startMenuLauncher; Target = $launcher }
+            [pscustomobject]@{ Path = $startMenuManager; Target = $manager }
+            [pscustomobject]@{ Path = $startMenuUninstaller; Target = $uninstaller }
+          )
+          foreach ($entry in $shortcutTargets) {
+            $target = $shell.CreateShortcut($entry.Path).TargetPath
+            if ($target -ne $entry.Target) {
+              throw "Unexpected shortcut target for $($entry.Path): $target"
+            }
+          }
+
+          $protocolCommand = (Get-Item -LiteralPath $protocolKey).GetValue("")
+          $expectedProtocolCommand = '"' + $manager + '" "%1"'
+          if ($protocolCommand -ne $expectedProtocolCommand) {
+            throw "Unexpected protocol command: $protocolCommand"
+          }
+
+          $helper = Start-Process -FilePath $launcher -ArgumentList "--helper-only" -PassThru
+          Start-Sleep -Seconds 2
+          if ($helper.HasExited) { throw "Installed launcher helper exited before upgrade" }
+          $upgrade = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) { throw "Upgrade exited with $($upgrade.ExitCode)" }
+          if (-not $helper.WaitForExit(5000)) {
+            Stop-Process -Id $helper.Id -Force
+            throw "Upgrade did not stop the running launcher"
+          }
+          $missingAfterUpgrade = $requiredPaths |
+            Where-Object { -not (Test-Path -LiteralPath $_) }
+          if ($missingAfterUpgrade) {
+            throw "Upgrade omitted: $($missingAfterUpgrade -join ', ')"
+          }
+
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with $($uninstall.ExitCode)" }
+          for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            $remaining = @(
+              $installDir,
+              $launcher,
+              $manager,
+              $uninstaller,
+              $desktopLauncher,
+              $desktopManager,
+              $startMenuDir,
+              $startMenuLauncher,
+              $startMenuManager,
+              $startMenuUninstaller,
+              $productKey,
+              $uninstallKey,
+              $protocolRoot,
+              $protocolKey
+            ) | Where-Object { Test-Path -LiteralPath $_ }
+            if (-not $remaining) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($remaining) { throw "Uninstaller left behind: $($remaining -join ', ')" }
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:

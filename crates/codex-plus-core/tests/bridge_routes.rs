@@ -1412,7 +1412,6 @@ impl BridgeDataService for FakeData {
             title,
         }))
     }
-
 }
 
 #[derive(Clone)]

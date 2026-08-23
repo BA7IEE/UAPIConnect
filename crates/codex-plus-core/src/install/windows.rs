@@ -188,9 +188,13 @@ fn register_url_protocol_key(
     crate::windows_integration::set_current_user_string_value(
         &format!(r"{key}\shell\open\command"),
         "",
-        &format!("\"{manager_path}\" \"%1\""),
+        &uapiconnect_url_protocol_command(manager_path),
     )?;
     Ok(())
+}
+
+pub fn uapiconnect_url_protocol_command(manager_path: &str) -> String {
+    format!("\"{manager_path}\" \"%1\"")
 }
 
 fn default_icon_path() -> PathBuf {

@@ -105,8 +105,28 @@ pub fn uninstall_entrypoints(options: &InstallOptions) -> InstallActionResult {
 }
 
 pub fn repair_entrypoints(options: &InstallOptions) -> InstallActionResult {
+    #[cfg(target_os = "macos")]
+    {
+        let result = macos::repair_app_bundles(options);
+        let success_message = match result.as_ref() {
+            Ok(summary) if summary.repaired.is_empty() => {
+                "入口检查完成，现有应用入口完整，未改写任何 bundle 文件。".to_string()
+            }
+            Ok(summary) => format!(
+                "入口检查完成，已修复无签名开发/测试入口：{}。",
+                summary.repaired.join("、")
+            ),
+            Err(_) => "入口修复失败。".to_string(),
+        };
+        return action_result(result.map(|_| ()), &success_message);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     let result = platform_install(options);
-    action_result(result, "入口已修复。")
+    #[cfg(not(target_os = "macos"))]
+    {
+        action_result(result, "入口已修复。")
+    }
 }
 
 pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> windows::WindowsEntrypointPlan {

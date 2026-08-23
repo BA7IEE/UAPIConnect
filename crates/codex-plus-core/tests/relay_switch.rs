@@ -96,6 +96,7 @@ base_url = "https://a.example/v1"
             RelayProfile {
                 id: "b".to_string(),
                 name: "B".to_string(),
+                model: "new-model".to_string(),
                 relay_mode: RelayMode::PureApi,
                 config_contents: r#"model_provider = "custom"
 
@@ -107,6 +108,8 @@ base_url = "https://b.example/v1"
 "#
                 .to_string(),
                 auth_contents: "{}".to_string(),
+                model_list: "new-model".to_string(),
+                model_windows: r#"{"new-model":"1M"}"#.to_string(),
                 ..RelayProfile::default()
             },
         ],
@@ -131,6 +134,48 @@ base_url = "https://b.example/v1"
         std::fs::read_to_string(home.join("auth.json")).unwrap(),
         r#"{"OPENAI_API_KEY":"sk-a"}"#
     );
+    assert!(!home.join("model-catalogs").join("b.json").exists());
+}
+
+#[test]
+fn switch_restores_target_managed_catalog_when_post_write_check_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir_all(home.join("model-catalogs")).unwrap();
+    std::fs::write(home.join("config.toml"), "model = \"old\"\n").unwrap();
+    std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-a"}"#).unwrap();
+    let target_catalog = home.join("model-catalogs").join("b.json");
+    let original_catalog = r#"{"models":[{"slug":"old-model","context_window":123000}]}"#;
+    std::fs::write(&target_catalog, original_catalog).unwrap();
+
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let original = BackendSettings {
+        active_relay_id: "a".to_string(),
+        relay_profiles: vec![pure_profile("a", "https://a.example/v1", "sk-a")],
+        ..BackendSettings::default()
+    };
+    store.save(&original).unwrap();
+
+    let mut target = pure_profile("b", "https://b.example/v1", "sk-b");
+    target.model = "new-model".to_string();
+    target.model_list = "new-model".to_string();
+    target.model_windows = r#"{"new-model":"1M"}"#.to_string();
+    // catalog 会先被覆盖，随后因纯 API 缺少 Key 触发 post-write 检查失败。
+    target.auth_contents = "{}".to_string();
+    let next = BackendSettings {
+        active_relay_id: "b".to_string(),
+        relay_profiles: vec![pure_profile("a", "https://a.example/v1", "sk-a"), target],
+        ..BackendSettings::default()
+    };
+
+    switch_relay_profile_in_home(&store, &home, next, "a")
+        .expect_err("missing api key should fail after writing the target catalog");
+
+    assert_eq!(
+        std::fs::read_to_string(&target_catalog).unwrap(),
+        original_catalog
+    );
+    assert_eq!(store.load().unwrap().active_relay_id, "a");
 }
 
 #[test]

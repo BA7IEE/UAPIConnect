@@ -33,6 +33,7 @@ Section "Install"
   File "${ROOT}\dist\uapi\windows\app\codex-plus-plus.exe"
   File "${ROOT}\dist\uapi\windows\app\codex-plus-plus-manager.exe"
   CreateShortcut "$DESKTOP\U-API Connect.lnk" "$INSTDIR\codex-plus-plus.exe" "" "$INSTDIR\codex-plus-plus.exe"
+  CreateShortcut "$DESKTOP\U-API Connect 设置.lnk" "$INSTDIR\codex-plus-plus-manager.exe" "" "$INSTDIR\codex-plus-plus-manager.exe"
   CreateDirectory "$SMPROGRAMS\U-API Connect"
   CreateShortcut "$SMPROGRAMS\U-API Connect\U-API Connect.lnk" "$INSTDIR\codex-plus-plus.exe" "" "$INSTDIR\codex-plus-plus.exe"
   CreateShortcut "$SMPROGRAMS\U-API Connect\U-API Connect 设置.lnk" "$INSTDIR\codex-plus-plus-manager.exe" "" "$INSTDIR\codex-plus-plus-manager.exe"
@@ -45,6 +46,9 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "DisplayIcon" "$INSTDIR\codex-plus-plus-manager.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "UninstallString" "$INSTDIR\uninstall.exe"
+  WriteRegStr HKCU "Software\Classes\uapiconnect" "" "URL:U-API Connect Protocol"
+  WriteRegStr HKCU "Software\Classes\uapiconnect" "URL Protocol" ""
+  WriteRegStr HKCU "Software\Classes\uapiconnect\shell\open\command" "" '"$INSTDIR\codex-plus-plus-manager.exe" "%1"'
 SectionEnd
 
 Section "Uninstall"
@@ -53,6 +57,7 @@ Section "Uninstall"
   nsExec::ExecToLog 'taskkill /IM codex-plus-plus-manager.exe /F'
   Pop $0
   Delete "$DESKTOP\U-API Connect.lnk"
+  Delete "$DESKTOP\U-API Connect 设置.lnk"
   Delete "$SMPROGRAMS\U-API Connect\U-API Connect.lnk"
   Delete "$SMPROGRAMS\U-API Connect\U-API Connect 设置.lnk"
   Delete "$SMPROGRAMS\U-API Connect\卸载 U-API Connect.lnk"
@@ -63,4 +68,5 @@ Section "Uninstall"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect"
   DeleteRegKey HKCU "Software\UAPIConnect"
+  DeleteRegKey HKCU "Software\Classes\uapiconnect"
 SectionEnd
