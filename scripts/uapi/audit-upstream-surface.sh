@@ -5,10 +5,11 @@ cd "$ROOT"
 
 # U-API edition code should stay concentrated in these paths plus a short list
 # of audited upstream integration points. The routes/settings/bridge/data test
-# entries below are exact rustfmt-only or atomic-write regression repairs; the
-# protocol-proxy test only replaces a flaky wall-clock assertion. The model
-# editor paths are the audited per-model catalog integration points.
-allowed='^(Cargo\.(toml|lock)|distribution/.*|docs/uapi/.*|scripts/uapi/.*|\.github/workflows/uapi-build\.yml|crates/codex-plus-core/Cargo\.toml|crates/codex-plus-core/src/(distribution|uapi)\.rs|crates/codex-plus-core/src/uapi/.*|crates/codex-plus-core/src/lib\.rs|crates/codex-plus-core/src/(ads|update|launcher|model_suffix|relay_config|relay_switch|routes|settings)\.rs|crates/codex-plus-core/src/install/.*|crates/codex-plus-core/tests/(bridge_routes|dream_skin_runtime|installers|launcher|model_suffix|protocol_proxy|relay_config|relay_switch)\.rs|crates/codex-plus-data/tests/(provider_sync|storage_adapter)\.rs|apps/codex-plus-launcher/(build\.rs|src/main\.rs)|apps/codex-plus-manager/(index\.html|src/uapi/.*|src/uapi-launch-policy(\.test)?\.ts|src/model-(routes\.test|windows(\.test)?)\.ts|src/App\.tsx|src/main\.tsx|src/styles\.css)|apps/codex-plus-manager/src-tauri/(build\.rs|tauri\.conf\.json|tests/windows_subsystem\.rs|src/(commands|lib|main|uapi_commands)\.rs))$'
+# entries below are exact rustfmt-only or atomic-write regression repairs. The
+# provider-sync source entry is the private deterministic seam for its TOCTOU
+# regression test; the protocol-proxy test only replaces a flaky wall-clock
+# assertion. The model editor paths are the audited per-model catalog points.
+allowed='^(Cargo\.(toml|lock)|distribution/.*|docs/uapi/.*|scripts/uapi/.*|\.github/workflows/uapi-build\.yml|crates/codex-plus-core/Cargo\.toml|crates/codex-plus-core/src/(distribution|uapi)\.rs|crates/codex-plus-core/src/uapi/.*|crates/codex-plus-core/src/lib\.rs|crates/codex-plus-core/src/(ads|update|launcher|model_suffix|relay_config|relay_switch|routes|settings)\.rs|crates/codex-plus-core/src/install/.*|crates/codex-plus-core/tests/(bridge_routes|dream_skin_runtime|installers|launcher|model_suffix|protocol_proxy|relay_config|relay_switch)\.rs|crates/codex-plus-data/src/provider_sync\.rs|crates/codex-plus-data/tests/(provider_sync|storage_adapter)\.rs|apps/codex-plus-launcher/(build\.rs|src/main\.rs)|apps/codex-plus-manager/(index\.html|src/uapi/.*|src/uapi-launch-policy(\.test)?\.ts|src/model-(routes\.test|windows(\.test)?)\.ts|src/App\.tsx|src/main\.tsx|src/styles\.css)|apps/codex-plus-manager/src-tauri/(build\.rs|tauri\.conf\.json|tests/windows_subsystem\.rs|src/(commands|lib|main|uapi_commands)\.rs))$'
 
 unexpected=0
 base_ref="${1:-}"
