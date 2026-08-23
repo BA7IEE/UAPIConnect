@@ -132,7 +132,24 @@ jobs:
           $missing = $requiredPaths | Where-Object { -not (Test-Path -LiteralPath $_) }
           if ($missing) { throw "Installer omitted: $($missing -join ', ')" }
 
-          $shell = New-Object -ComObject WScript.Shell
+          # WScript.Shell cannot reliably reopen shortcuts whose names contain CJK text.
+          $shell = New-Object -ComObject Shell.Application
+          function Get-ShortcutTarget {
+            param([string]$ShortcutPath)
+            $folder = $shell.Namespace((Split-Path -Parent $ShortcutPath))
+            if ($null -eq $folder) {
+              throw "Cannot open shortcut folder: $ShortcutPath"
+            }
+            $item = $folder.ParseName((Split-Path -Leaf $ShortcutPath))
+            if ($null -eq $item) {
+              throw "Cannot find shortcut through Windows Shell: $ShortcutPath"
+            }
+            $link = $item.GetLink
+            if ($null -eq $link -or [string]::IsNullOrWhiteSpace($link.Path)) {
+              throw "Cannot resolve shortcut through Windows Shell: $ShortcutPath"
+            }
+            return [System.IO.Path]::GetFullPath([string]$link.Path)
+          }
           $shortcutTargets = @(
             [pscustomobject]@{ Path = $desktopLauncher; Target = $launcher }
             [pscustomobject]@{ Path = $desktopManager; Target = $manager }
@@ -140,12 +157,16 @@ jobs:
             [pscustomobject]@{ Path = $startMenuManager; Target = $manager }
             [pscustomobject]@{ Path = $startMenuUninstaller; Target = $uninstaller }
           )
-          foreach ($entry in $shortcutTargets) {
-            $target = $shell.CreateShortcut($entry.Path).TargetPath
-            if ($target -ne $entry.Target) {
-              throw "Unexpected shortcut target for $($entry.Path): $target"
+          function Assert-ShortcutTargets {
+            foreach ($entry in $shortcutTargets) {
+              $target = Get-ShortcutTarget -ShortcutPath $entry.Path
+              $expectedTarget = [System.IO.Path]::GetFullPath($entry.Target)
+              if ($target -ne $expectedTarget) {
+                throw "Unexpected shortcut target for $($entry.Path): $target; expected $expectedTarget"
+              }
             }
           }
+          Assert-ShortcutTargets
 
           $protocolCommand = (Get-Item -LiteralPath $protocolKey).GetValue("")
           $expectedProtocolCommand = '"' + $manager + '" "%1"'
@@ -167,6 +188,7 @@ jobs:
           if ($missingAfterUpgrade) {
             throw "Upgrade omitted: $($missingAfterUpgrade -join ', ')"
           }
+          Assert-ShortcutTargets
 
           $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "Uninstaller exited with $($uninstall.ExitCode)" }
@@ -191,12 +213,20 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           if ($remaining) { throw "Uninstaller left behind: $($remaining -join ', ')" }
-      - name: Upload Windows installer
+      - name: Upload validated Windows installer
         uses: actions/upload-artifact@v4
         with:
           name: uapi-connect-windows-x64
           path: dist/uapi/windows/*.exe
           if-no-files-found: error
+      - name: Upload failed Windows installer for diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uapi-connect-windows-x64-unvalidated
+          path: dist/uapi/windows/*.exe
+          if-no-files-found: ignore
+          retention-days: 3
 
   macos:
     name: macOS ${{ matrix.arch }}
