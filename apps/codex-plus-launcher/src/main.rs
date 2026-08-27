@@ -7,6 +7,7 @@ use codex_plus_core::launcher::{
 use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
 use codex_plus_core::status::LaunchStatus;
+use codex_plus_core::uapi::{UapiConnectionMode, UapiStatus};
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,24 @@ struct LauncherHooks {
     data: Arc<LauncherDataService>,
     runtime: Arc<LauncherRuntimeService>,
     bridge_context: Arc<Mutex<Option<BridgeContext>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedProviderLaunchPreparation {
+    OpenConnectionSettings,
+    RefreshModels,
+    Continue,
+}
+
+fn fixed_provider_launch_preparation(status: &UapiStatus) -> FixedProviderLaunchPreparation {
+    match status.connection_mode {
+        UapiConnectionMode::Uapi if !status.configured => {
+            FixedProviderLaunchPreparation::OpenConnectionSettings
+        }
+        UapiConnectionMode::Uapi => FixedProviderLaunchPreparation::RefreshModels,
+        // 官方登录由原生 Codex 完成，未登录时也必须继续启动才能进入登录流程。
+        UapiConnectionMode::Official => FixedProviderLaunchPreparation::Continue,
+    }
 }
 
 impl Default for LauncherHooks {
@@ -49,7 +68,7 @@ async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let helper_only = args.iter().any(|arg| arg == "--helper-only");
     let options = parse_launch_options(args.iter());
-    if let Err(error) = launcher_main(args, helper_only, options.clone()).await {
+    if let Err(error) = launcher_main(helper_only, options.clone()).await {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.failed",
             json!({
@@ -73,17 +92,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn launcher_main(
-    args: Vec<String>,
-    helper_only: bool,
-    options: LaunchOptions,
-) -> Result<()> {
+async fn launcher_main(helper_only: bool, options: LaunchOptions) -> Result<()> {
     if helper_only {
         let hooks = LauncherHooks::default();
         hooks.start_helper(options.helper_port).await?;
         std::future::pending::<()>().await;
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
+    }
+    if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+        if let Err(error) = codex_plus_core::uapi::enforce_distribution_defaults() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "uapi.distribution_defaults_failed_nonfatal",
+                json!({ "message": error.to_string() }),
+            );
+        }
+        match fixed_provider_launch_preparation(&codex_plus_core::uapi::status()) {
+            FixedProviderLaunchPreparation::OpenConnectionSettings => {
+                codex_plus_core::install::spawn_companion(
+                    codex_plus_core::install::MANAGER_BINARY,
+                    ["--configure"],
+                )
+                .map_err(|error| anyhow::anyhow!("启动连接设置失败：{error}"))?;
+                return Ok(());
+            }
+            FixedProviderLaunchPreparation::RefreshModels => {
+                if let Err(error) = codex_plus_core::uapi::refresh_models().await {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "uapi.models_refresh_failed_nonfatal",
+                        json!({ "message": error.to_string() }),
+                    );
+                }
+            }
+            FixedProviderLaunchPreparation::Continue => {}
+        }
     }
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
@@ -99,9 +141,11 @@ async fn launcher_main(
         })?;
         return Ok(());
     };
-    tokio::spawn(async {
-        let _ = notify_manager_when_update_available().await;
-    });
+    if codex_plus_core::distribution::UPDATES_ENABLED {
+        tokio::spawn(async {
+            let _ = notify_manager_when_update_available().await;
+        });
+    }
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
@@ -1089,6 +1133,83 @@ fn default_user_scripts_config_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixed_provider_status(
+        connection_mode: UapiConnectionMode,
+        configured: bool,
+        official_authenticated: bool,
+    ) -> UapiStatus {
+        UapiStatus {
+            configured,
+            active: connection_mode == UapiConnectionMode::Uapi,
+            connection_mode,
+            uapi_ready: configured,
+            official_login_saved: official_authenticated,
+            official_authenticated,
+            official_account_label: None,
+            credential_store_available: true,
+            credential_store_message: String::new(),
+            provider_id: String::new(),
+            base_url: String::new(),
+            current_model: String::new(),
+            compatible_models: Vec::new(),
+            model_count: 0,
+            api_key_masked: String::new(),
+            config_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn official_mode_launches_when_authenticated() {
+        let status = fixed_provider_status(UapiConnectionMode::Official, false, true);
+
+        assert_eq!(
+            fixed_provider_launch_preparation(&status),
+            FixedProviderLaunchPreparation::Continue
+        );
+    }
+
+    #[test]
+    fn official_mode_launches_before_native_login() {
+        let status = fixed_provider_status(UapiConnectionMode::Official, false, false);
+
+        assert_eq!(
+            fixed_provider_launch_preparation(&status),
+            FixedProviderLaunchPreparation::Continue
+        );
+    }
+
+    #[test]
+    fn default_uapi_mode_requires_configuration_then_refreshes_models() {
+        let unconfigured = fixed_provider_status(UapiConnectionMode::default(), false, false);
+        let configured = fixed_provider_status(UapiConnectionMode::default(), true, false);
+
+        assert_eq!(
+            fixed_provider_launch_preparation(&unconfigured),
+            FixedProviderLaunchPreparation::OpenConnectionSettings
+        );
+        assert_eq!(
+            fixed_provider_launch_preparation(&configured),
+            FixedProviderLaunchPreparation::RefreshModels
+        );
+    }
+
+    #[test]
+    fn degraded_credential_storage_does_not_override_runtime_readiness() {
+        let mut official = fixed_provider_status(UapiConnectionMode::Official, false, false);
+        official.credential_store_available = false;
+        let mut live_uapi = fixed_provider_status(UapiConnectionMode::Uapi, true, false);
+        live_uapi.credential_store_available = false;
+
+        assert_eq!(
+            fixed_provider_launch_preparation(&official),
+            FixedProviderLaunchPreparation::Continue
+        );
+        assert_eq!(
+            fixed_provider_launch_preparation(&live_uapi),
+            FixedProviderLaunchPreparation::RefreshModels
+        );
+    }
 
     #[test]
     fn parse_launch_options_accepts_manager_forwarded_ports_and_app_path() {

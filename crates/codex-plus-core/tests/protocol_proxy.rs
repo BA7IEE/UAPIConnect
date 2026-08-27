@@ -21,7 +21,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -1786,20 +1786,24 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
         let Ok((_stream, _addr)) = listener.accept().await else {
             return;
         };
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
     });
 
-    let started = Instant::now();
-    let result = send_upstream_request_with_header_timeout(
-        upstream_http_client()
-            .unwrap()
-            .get(format!("http://{addr}/v1/models")),
-        Duration::from_millis(100),
+    // 用独立的宽松上限识别真正卡死，避免用 1 秒墙钟断言承受并行测试
+    // 的调度抖动。内部 100ms 超时若失效，连接会保持 10 秒并触发外层失败。
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        send_upstream_request_with_header_timeout(
+            upstream_http_client()
+                .unwrap()
+                .get(format!("http://{addr}/v1/models")),
+            Duration::from_millis(100),
+        ),
     )
-    .await;
+    .await
+    .expect("100ms response-header timeout must finish within the outer safety bound");
 
     assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(1));
     server.abort();
 }
 

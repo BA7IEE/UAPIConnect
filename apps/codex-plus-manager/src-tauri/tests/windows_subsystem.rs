@@ -95,12 +95,24 @@ fn launcher_binary_embeds_codex_icon_resource() {
 }
 
 #[test]
-fn windows_binaries_run_as_invoker_without_administrator_privileges() {
+fn windows_binaries_select_distribution_manifest_without_administrator_privileges() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository_root = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap();
     let manager_build =
         std::fs::read_to_string(manifest_dir.join("build.rs")).expect("read manager build.rs");
     let windows_manifest = std::fs::read_to_string(manifest_dir.join("windows-app-manifest.xml"))
         .expect("read windows app manifest");
+    let uapi_windows_manifest = std::fs::read_to_string(
+        repository_root.join("scripts/uapi/installer/windows/UAPIConnect.exe.manifest.xml"),
+    )
+    .expect("read U-API Windows app manifest");
+    let uapi_build_workflow =
+        std::fs::read_to_string(repository_root.join(".github/workflows/uapi-build.yml"))
+            .expect("read U-API build workflow");
     let launcher_build = manifest_dir
         .parent()
         .and_then(std::path::Path::parent)
@@ -118,16 +130,24 @@ fn windows_binaries_run_as_invoker_without_administrator_privileges() {
 
     assert!(manager_build.contains("windows-app-manifest.xml"));
     assert!(launcher_build.contains("windows-app-manifest.xml"));
-    // Elevated launcher processes also elevate Codex, so Explorer file drops are blocked by UIPI.
+    assert!(manager_build.contains("UAPI_CONNECT_DISTRIBUTION"));
+    assert!(launcher_build.contains("UAPI_CONNECT_DISTRIBUTION"));
+    assert!(manager_build.contains("UAPIConnect.exe.manifest.xml"));
+    assert!(launcher_build.contains("UAPIConnect.exe.manifest.xml"));
+    // 提权后的启动器也会让 Codex 提权，进而被 UIPI 阻止接收资源管理器拖放。
     assert!(windows_manifest.contains("asInvoker"));
     assert!(!windows_manifest.contains("requireAdministrator"));
+    assert!(uapi_windows_manifest.contains("asInvoker"));
+    assert!(!uapi_windows_manifest.contains("requireAdministrator"));
     assert!(windows_manifest.contains("Microsoft.Windows.Common-Controls"));
+    assert!(uapi_windows_manifest.contains("Microsoft.Windows.Common-Controls"));
     assert!(windows_installer.contains("RequestExecutionLevel user"));
     assert!(!windows_installer.contains("RequestExecutionLevel admin"));
+    assert!(uapi_build_workflow.contains("UAPI_CONNECT_DISTRIBUTION: \"1\""));
 }
 
 #[test]
-fn windows_entrypoints_register_codexplusplus_url_protocol() {
+fn windows_entrypoints_register_uapiconnect_url_protocol() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let windows_install = manifest_dir
         .parent()
@@ -138,9 +158,53 @@ fn windows_entrypoints_register_codexplusplus_url_protocol() {
     let windows_install =
         std::fs::read_to_string(&windows_install).expect("read windows install source");
 
-    assert!(windows_install.contains("Software\\Classes\\codexplusplus"));
+    assert!(windows_install.contains("Software\\Classes\\uapiconnect"));
     assert!(windows_install.contains("URL Protocol"));
     assert!(windows_install.contains("%1"));
+}
+
+#[test]
+fn uapi_nsis_installer_owns_manager_shortcut_and_url_protocol_lifecycle() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository_root = manifest_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let windows_install = std::fs::read_to_string(
+        repository_root.join("crates/codex-plus-core/src/install/windows.rs"),
+    )
+    .expect("read Windows entrypoint source");
+    let nsis = std::fs::read_to_string(
+        repository_root.join("scripts/uapi/installer/windows/UAPIConnect.nsi"),
+    )
+    .expect("read U-API Windows installer");
+
+    assert!(windows_install.contains(r#"r"Software\Classes\uapiconnect""#));
+    assert!(windows_install.contains(r#"join("U-API Connect 设置.lnk")"#));
+    assert!(
+        windows_install.contains("uapiconnect_url_protocol_command(manager_path)"),
+        "core protocol command must quote both the manager path and URL"
+    );
+
+    assert!(nsis.contains(
+        r#"CreateShortcut "$DESKTOP\U-API Connect 设置.lnk" "$INSTDIR\codex-plus-plus-manager.exe""#
+    ));
+    assert!(
+        nsis.contains("RequestExecutionLevel user"),
+        "U-API binaries and installer must stay in the interactive user's account"
+    );
+    assert!(nsis.contains(r#"WriteRegStr HKCU "Software\Classes\uapiconnect" "URL Protocol" """#));
+    let expected_protocol_command = r#"  WriteRegStr HKCU "Software\Classes\uapiconnect\shell\open\command" "" '"$INSTDIR\codex-plus-plus-manager.exe" "%1"'"#;
+    assert_eq!(
+        nsis.lines()
+            .filter(|line| line.contains(r"Software\Classes\uapiconnect\shell\open\command"))
+            .collect::<Vec<_>>(),
+        [expected_protocol_command]
+    );
+    assert!(nsis.contains(r#"Delete "$DESKTOP\U-API Connect 设置.lnk""#));
+    assert!(nsis.contains(r#"DeleteRegKey HKCU "Software\Classes\uapiconnect""#));
+    assert!(!nsis.contains(r#"DeleteRegKey HKCU "Software\Classes""#));
 }
 
 #[test]

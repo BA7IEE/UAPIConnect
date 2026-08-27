@@ -2894,15 +2894,18 @@ export function App() {
     if (result) showNotice(t("纯 API 模式"), t("已切换到纯 API；Codex增强已设为完整增强。"), result.status);
   };
 
-  const switchRelayProfile = async (next: BackendSettings, previousActiveRelayId = settingsForm.activeRelayId) => {
+  const switchRelayProfile = async (
+    next: BackendSettings,
+    previousActiveRelayId = settingsForm.activeRelayId,
+  ): Promise<boolean> => {
     if (relaySwitching) {
       showNotice(t("供应商切换中"), t("上一次切换还没有完成，请稍后再试。"), "failed");
-      return;
+      return false;
     }
     let switchSettings = normalizeSettings(next);
     if (!switchSettings.relayProfilesEnabled) {
       showNotice(t("供应商配置已关闭"), t("当前不会写入 Codex config.toml / auth.json。打开供应商配置总开关后再切换。"), "failed");
-      return;
+      return false;
     }
     const targetBeforeSnapshot = activeRelayProfile(switchSettings);
     logDiagnostic("switchRelayProfile.start", {
@@ -2920,9 +2923,11 @@ export function App() {
         error: validationError,
       });
       showNotice(t("供应商配置可能不正确"), validationError, "failed");
-      return;
+      return false;
     }
-    switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
+    if (previousActiveRelayId.trim() !== switchSettings.activeRelayId.trim()) {
+      switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
+    }
     const selectedAfterSave = activeRelayProfile(switchSettings);
     const command = relayProfileSwitchCommand(selectedAfterSave);
 
@@ -2943,7 +2948,7 @@ export function App() {
         logDiagnostic("switchRelayProfile.apply_no_result", {
           targetRelayId: selectedAfterSave.id,
         });
-        return;
+        return false;
       }
       const selectedSettings = normalizeSettings(result.settings);
       setSettings({
@@ -2968,7 +2973,7 @@ export function App() {
           activeRelayId: selectedSettings.activeRelayId,
         });
         showNotice(t("供应商切换"), result.message, result.status);
-        return;
+        return false;
       }
       const currentSelected = activeRelayProfile(selectedSettings);
       logDiagnostic("switchRelayProfile.ok", {
@@ -2976,6 +2981,7 @@ export function App() {
         launchMode: selectedSettings.launchMode,
         status: result.status,
       });
+      return true;
     } finally {
       setRelaySwitching(false);
     }
@@ -3813,7 +3819,7 @@ type Actions = {
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
   fetchSub2ApiBilling: (profile: RelayProfile) => Promise<Sub2ApiBillingResult | null>;
-  switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<void>;
+  switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<boolean>;
   relaySwitching: boolean;
   switchOfficialMode: () => Promise<void>;
   switchPureApiMode: () => Promise<void>;
@@ -7801,9 +7807,17 @@ function RelayProfileDetail({
   actions: Actions;
 }) {
   const [draft, setDraft] = useState<RelayProfile>(profile);
-  const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
-    modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
+  const [modelWindowState, setModelWindowState] = useState(
+    () => modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
   );
+  const modelWindowRows = modelWindowState.rows;
+  const modelWindowsValidationError = isAggregateRelayProfile(draft)
+    ? null
+    : modelWindowState.validationError;
+  const setModelWindowRows = (rows: ModelWindowRow[]) => {
+    // 用户明确编辑后，保存路径会从当前行重新生成合法 JSON。
+    setModelWindowState({ rows, validationError: null });
+  };
   const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
   const [doctorOpen, setDoctorOpen] = useState(false);
   // 通用配置弹窗的开关放在这一层：.relay-profile-editor 有 will-change，
@@ -7830,10 +7844,15 @@ function RelayProfileDetail({
       ? applyRelayProfilePatchToFiles(liveDraft, { apiKey: storedApiKey })
       : liveDraft;
     setDraft(nextDraft);
-    setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || "", nextDraft.modelVlm));
+    setModelWindowState(modelWindowRowsFromProfile(
+      nextDraft.modelList,
+      nextDraft.modelWindows || "",
+      nextDraft.modelVlm,
+    ));
   }, [profile.id, profile.modelList, profile.modelWindows, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
   const validationSettings = relaySettingsWithDraft(form, profile.id, draft, isNew);
-  const validationError = relaySessionProviderValidation(draft)
+  const validationError = modelWindowsValidationError
+    ?? relaySessionProviderValidation(draft)
     ?? (isAggregateRelayProfile(draft)
       ? aggregateRelayProfileValidation(draft)
       : relayModelRoutesSettingsValidation(validationSettings));
@@ -7861,18 +7880,27 @@ function RelayProfileDetail({
     if (requiresRestart && !window.confirm(t("首次启用单模型路由需要启动本地协议代理。保存后将立即重启 Codex，使路由安全生效。是否继续？"))) {
       return;
     }
+    const targetProfile = next.relayProfiles.find((candidate) => candidate.id === normalizedDraft.id)
+      ?? normalizedDraft;
+    const shouldApplyActive = isActive
+      && next.relayProfilesEnabled
+      && relayProfileUsesLiveFiles(targetProfile);
+    if (shouldApplyActive) {
+      // 后端切换事务会同时保存 settings、catalog、config 与 auth；失败时全部回滚。
+      const applied = await actions.switchRelayProfile(next, form.activeRelayId);
+      if (!applied) return;
+      if (requiresRestart) {
+        const restarted = await actions.restart(true);
+        if (!restarted) return;
+      }
+      onSaved?.();
+      return;
+    }
     const savedSettings = await onFormChange(next);
     if (!savedSettings) return;
     if (requiresRestart) {
       const restarted = await actions.restart(true);
       if (!restarted) return;
-      onSaved?.();
-      return;
-    }
-    const savedProfile = savedSettings.relayProfiles.find((candidate) => candidate.id === normalizedDraft.id)
-      ?? normalizedDraft;
-    if (isActive && savedSettings.relayProfilesEnabled && relayProfileUsesLiveFiles(savedProfile)) {
-      await actions.switchRelayProfile(savedSettings, savedSettings.activeRelayId);
     }
     onSaved?.();
   };
@@ -7918,6 +7946,9 @@ function RelayProfileDetail({
         {aggregateProfile ? <UiBadge variant="secondary">{t("聚合")}</UiBadge> : null}
       </div>
       <div className="relay-detail-body">
+        {modelWindowsValidationError ? (
+          <p className="field-hint" role="alert">{modelWindowsValidationError}</p>
+        ) : null}
         <RelayProfileEditor
           profile={draft}
           form={form}
@@ -11379,6 +11410,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
   const upstreamBaseUrl = profile.upstreamBaseUrl || chatUpstreamBaseUrl || (configBaseUrl && !isProxyConfig ? configBaseUrl : profile.baseUrl || "");
   const configApiKey = codexExperimentalBearerTokenFromConfig(configContents);
   const configModel = codexModelFromConfig(configContents);
+  const hasPerModelWindows = relayProfileHasPerModelWindows(profile);
   // 如果用户输入了带后缀的模型名，优先保留在界面的「配置模型」字段中；
   // config.toml 里实际写的是剥离后缀的 slug（由 applyRelayProfilePatchToFiles 处理）。
   const model = /\[.+\]$/.test(profile.model.trim()) ? profile.model.trim() : configModel;
@@ -11391,11 +11423,34 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     apiKey: profile.relayMode === "official"
       ? configApiKey || profile.apiKey || ""
       : codexApiKeyFromAuth(authContents) || configApiKey || "",
-    contextWindow: codexTopLevelIntFromConfig(configContents, "model_context_window"),
-    autoCompactLimit: codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit"),
+    // 有逐模型窗口时，raw 顶层值可能是用户手写 override，不能自动认领成 profile 单值；
+    // 只保留已经存在的结构化 fallback，避免后续 apply 误删手写键。
+    contextWindow: hasPerModelWindows
+      ? profile.contextWindow || ""
+      : codexTopLevelIntFromConfig(configContents, "model_context_window") || profile.contextWindow || "",
+    autoCompactLimit: hasPerModelWindows
+      ? profile.autoCompactLimit || ""
+      : codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit") || profile.autoCompactLimit || "",
     configContents,
     authContents,
   };
+}
+
+function relayProfileHasPerModelWindows(profile: RelayProfile): boolean {
+  const serialized = (profile.modelWindows || "").trim();
+  if (serialized) {
+    try {
+      const parsed = JSON.parse(serialized) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
+      return Object.keys(parsed).length > 0;
+    } catch {
+      // 后端 apply 会报告损坏 JSON；派生阶段先保守保留顶层键的手写属性。
+      return true;
+    }
+  }
+  return (profile.modelList || "")
+    .split(/[\r\n,]/)
+    .some((model) => parseModelSuffix(model).window !== undefined);
 }
 
 function applyRelayProfilePatchToFiles(

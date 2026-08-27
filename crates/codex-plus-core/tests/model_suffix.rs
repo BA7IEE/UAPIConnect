@@ -53,6 +53,14 @@ fn parse_suffix_rejects_zero_and_negative() {
 }
 
 #[test]
+fn parse_suffix_rejects_multiplication_overflow_without_panicking() {
+    assert_eq!(
+        parse_model_suffix("foo[18446744073709551615M]"),
+        ("foo[18446744073709551615M]".to_string(), None)
+    );
+}
+
+#[test]
 fn collect_entries_includes_current_model_and_strips_suffix() {
     let mut windows = HashMap::new();
     windows.insert("deepseek-v4-pro".to_string(), "1M".to_string());

@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 pub mod macos;
 pub mod windows;
 
-pub const SILENT_NAME: &str = "Codex++";
-pub const MANAGER_NAME: &str = "Codex++ 管理工具";
+pub const SILENT_NAME: &str = crate::distribution::PRODUCT_NAME;
+pub const MANAGER_NAME: &str = crate::distribution::MANAGER_DISPLAY_NAME;
 pub const SILENT_BINARY: &str = "codex-plus-plus";
 pub const MANAGER_BINARY: &str = "codex-plus-plus-manager";
-pub const SILENT_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus";
-pub const MANAGER_BUNDLE_ID: &str = "com.bigpizzav3.codexplusplus.manager";
+pub const SILENT_BUNDLE_ID: &str = crate::distribution::SILENT_BUNDLE_ID;
+pub const MANAGER_BUNDLE_ID: &str = crate::distribution::MANAGER_BUNDLE_ID;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -76,11 +76,11 @@ impl ShortcutState {
 }
 
 pub fn shortcut_names() -> (&'static str, &'static str) {
-    ("Codex++.lnk", "Codex++ 管理工具.lnk")
+    ("U-API Connect.lnk", "U-API Connect 设置.lnk")
 }
 
 pub fn app_bundle_names() -> (&'static str, &'static str) {
-    ("Codex++.app", "Codex++ 管理工具.app")
+    ("U-API Connect.app", "U-API Connect 设置.app")
 }
 
 pub fn inspect_entrypoints() -> EntryPointState {
@@ -105,8 +105,28 @@ pub fn uninstall_entrypoints(options: &InstallOptions) -> InstallActionResult {
 }
 
 pub fn repair_entrypoints(options: &InstallOptions) -> InstallActionResult {
+    #[cfg(target_os = "macos")]
+    {
+        let result = macos::repair_app_bundles(options);
+        let success_message = match result.as_ref() {
+            Ok(summary) if summary.repaired.is_empty() => {
+                "入口检查完成，现有应用入口完整，未改写任何 bundle 文件。".to_string()
+            }
+            Ok(summary) => format!(
+                "入口检查完成，已修复无签名开发/测试入口：{}。",
+                summary.repaired.join("、")
+            ),
+            Err(_) => "入口修复失败。".to_string(),
+        };
+        return action_result(result.map(|_| ()), &success_message);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     let result = platform_install(options);
-    action_result(result, "入口已修复。")
+    #[cfg(not(target_os = "macos"))]
+    {
+        action_result(result, "入口已修复。")
+    }
 }
 
 pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> windows::WindowsEntrypointPlan {

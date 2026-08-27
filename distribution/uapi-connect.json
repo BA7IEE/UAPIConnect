@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "productId": "uapi-connect",
+  "productName": "U-API Connect",
+  "managerTitle": "U-API Connect",
+  "productSubtitle": "Codex 接入工具",
+  "publisher": "U-Studio",
+  "fixedProviderId": "uapi_connect",
+  "fixedProviderName": "U-API Connect",
+  "fixedBaseUrl": "https://token.u-studio.cn/v1",
+  "helpUrl": "https://token.u-studio.cn/",
+  "upstreamSourceUrl": "https://github.com/BigPizzaV3/CodexPlusPlus",
+  "updateFeedUrl": "https://token.u-studio.cn/uapi-connect/latest.json",
+  "updateRepository": "U-Studio/UAPIConnect",
+  "features": {
+    "fixedProviderEdition": true,
+    "adsEnabled": false,
+    "updatesEnabled": false,
+    "backgroundFeaturesEnabled": false
+  },
+  "visibleRoutes": [
+    "overview",
+    "connection",
+    "maintenance",
+    "about"
+  ],
+  "managerDisplayName": "U-API Connect 设置",
+  "silentBundleId": "cn.u-studio.uapi.connect",
+  "managerBundleId": "cn.u-studio.uapi.connect.manager",
+  "urlScheme": "uapiconnect"
+}

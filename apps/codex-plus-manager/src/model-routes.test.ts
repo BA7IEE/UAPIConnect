@@ -47,7 +47,16 @@ test("model route inputs keep focus while editing and label the example placehol
   assert.match(source, /relayModelRoutesSettingsValidation\(validationSettings\)/);
   assert.match(
     source,
-    /if \(requiresRestart\) \{[\s\S]*?actions\.restart\(true\)[\s\S]*?return;[\s\S]*?actions\.switchRelayProfile\(savedSettings, savedSettings\.activeRelayId\)/,
+    /const shouldApplyActive = isActive[\s\S]*?const applied = await actions\.switchRelayProfile\(next, form\.activeRelayId\);[\s\S]*?if \(!applied\) return;/,
+  );
+  assert.match(source, /switchRelayProfile: \(settings: BackendSettings,[\s\S]*?=> Promise<boolean>/);
+  assert.match(
+    source,
+    /if \(previousActiveRelayId\.trim\(\) !== switchSettings\.activeRelayId\.trim\(\)\) \{[\s\S]*?snapshotActiveRelayFilesBeforeSwitch/,
+  );
+  assert.match(
+    source,
+    /contextWindow: hasPerModelWindows[\s\S]*?\? profile\.contextWindow \|\| ""[\s\S]*?: codexTopLevelIntFromConfig\(configContents, "model_context_window"\)/,
   );
 });
 

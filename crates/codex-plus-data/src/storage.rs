@@ -3,7 +3,7 @@ use codex_plus_core::models::{DeleteResult, DeleteStatus, SessionRef};
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -24,8 +24,9 @@ pub fn delete_local_from_paths(
     let mut backup_tokens = Vec::new();
     for db_path in db_paths {
         let adapter = match codex_home {
-            Some(home) => SQLiteStorageAdapter::new(db_path, backup_store.clone())
-                .with_codex_home(home),
+            Some(home) => {
+                SQLiteStorageAdapter::new(db_path, backup_store.clone()).with_codex_home(home)
+            }
             None => SQLiteStorageAdapter::new(db_path, backup_store.clone()),
         };
         let candidate_result = adapter.delete_local(session);
@@ -565,16 +566,16 @@ impl SQLiteStorageAdapter {
                 }
             }
         }
-        let session_index_note = self
-            .codex_home
-            .as_deref()
-            .and_then(|home| {
-                crate::provider_sync::remove_session_index_entry(home, &thread_id)
-                    .err()
-                    .map(|error| format!("session_index.jsonl 清理失败：{error}"))
-            });
+        let session_index_note = self.codex_home.as_deref().and_then(|home| {
+            crate::provider_sync::remove_session_index_entry(home, &thread_id)
+                .err()
+                .map(|error| format!("session_index.jsonl 清理失败：{error}"))
+        });
         if !file_errors.is_empty() {
-            let mut message = format!("本地数据库已删除，但文件删除失败：{}", file_errors.join("; "));
+            let mut message = format!(
+                "本地数据库已删除，但文件删除失败：{}",
+                file_errors.join("; ")
+            );
             if let Some(note) = session_index_note.as_deref() {
                 message = format!("{message}；{note}");
             }

@@ -1,8 +1,93 @@
+#[cfg(target_os = "macos")]
+use codex_plus_core::install::macos::{install_app_bundles, repair_app_bundles};
+use codex_plus_core::install::windows::uapiconnect_url_protocol_command;
 use codex_plus_core::install::{
     InstallOptions, MANAGER_BUNDLE_ID, SILENT_BINARY, SILENT_BUNDLE_ID, app_bundle_names,
     build_macos_app_bundle, build_windows_entrypoint_plan, companion_binary_path_from_exe,
     default_install_root_strategy, macos_companion_bundle_identifier_from_exe, shortcut_names,
 };
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+#[cfg(target_os = "macos")]
+fn write_fake_macho(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn packaged_uapi_plist(
+    display_name: &str,
+    executable_name: &str,
+    bundle_id: &str,
+    manager: bool,
+) -> String {
+    let url_types = if manager {
+        r#"<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>U-API Connect Links</string>
+<key>CFBundleURLSchemes</key><array><string>uapiconnect</string></array>
+</dict></array>"#
+    } else {
+        ""
+    };
+    let lsui_element = if manager { "false" } else { "true" };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>{display_name}</string>
+<key>CFBundleDisplayName</key><string>{display_name}</string>
+<key>CFBundleIdentifier</key><string>{bundle_id}</string>
+<key>CFBundleVersion</key><string>99.0.0</string>
+<key>CFBundleShortVersionString</key><string>99.0.0</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleExecutable</key><string>{executable_name}</string>
+<key>CFBundleIconFile</key><string>uapi-connect.icns</string>
+{url_types}
+<key>LSUIElement</key><{lsui_element}/>
+</dict></plist>"#
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn write_packaged_uapi_bundle(
+    bundle: &codex_plus_core::install::MacosAppBundle,
+    manager: bool,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let executable_name = if manager {
+        "CodexPlusPlusManager"
+    } else {
+        "CodexPlusPlus"
+    };
+    let bundle_id = if manager {
+        MANAGER_BUNDLE_ID
+    } else {
+        SILENT_BUNDLE_ID
+    };
+    let display_name = if manager {
+        "U-API Connect 设置"
+    } else {
+        "U-API Connect"
+    };
+    let contents = bundle.app_path.join("Contents");
+    let info_plist = contents.join("Info.plist");
+    let executable = contents.join("MacOS").join(executable_name);
+    std::fs::create_dir_all(contents.join("_CodeSignature")).unwrap();
+    std::fs::write(
+        &info_plist,
+        packaged_uapi_plist(display_name, executable_name, bundle_id, manager),
+    )
+    .unwrap();
+    std::fs::write(
+        contents.join("_CodeSignature/CodeResources"),
+        b"signed bundle marker",
+    )
+    .unwrap();
+    write_fake_macho(&executable);
+    (info_plist, executable)
+}
 
 #[test]
 fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
@@ -15,8 +100,9 @@ fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
 
     let plan = build_windows_entrypoint_plan(&options);
 
-    assert!(plan.silent_shortcut.ends_with("Codex++.lnk"));
-    assert!(plan.manager_shortcut.ends_with("Codex++ 管理工具.lnk"));
+    let (silent_shortcut, manager_shortcut) = shortcut_names();
+    assert!(plan.silent_shortcut.ends_with(silent_shortcut));
+    assert!(plan.manager_shortcut.ends_with(manager_shortcut));
     assert_eq!(plan.launcher_path, "C:/Tools/codex-plus-plus.exe");
     assert_eq!(plan.manager_path, "C:/Tools/codex-plus-plus-manager.exe");
     assert_eq!(plan.silent_icon_path, "C:/Tools/codex-plus-plus.exe");
@@ -24,7 +110,7 @@ fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
         plan.manager_icon_path,
         "C:/Tools/codex-plus-plus-manager.exe"
     );
-    assert_eq!(plan.uninstall_key, "CodexPlusPlus");
+    assert_eq!(plan.uninstall_key, "UAPIConnect");
     assert_eq!(plan.legacy_uninstall_key, "Codex++");
     assert_eq!(
         plan.uninstaller_path.replace('\\', "/"),
@@ -45,6 +131,16 @@ fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
 }
 
 #[test]
+fn windows_url_protocol_command_quotes_the_manager_and_full_url() {
+    assert_eq!(
+        uapiconnect_url_protocol_command(
+            "C:\\Program Files\\U-API Connect\\codex-plus-plus-manager.exe"
+        ),
+        "\"C:\\Program Files\\U-API Connect\\codex-plus-plus-manager.exe\" \"%1\""
+    );
+}
+
+#[test]
 fn windows_entrypoint_plan_can_request_owned_data_removal_without_shell_script() {
     let options = InstallOptions {
         install_root: Some("C:/Users/A/Desktop".into()),
@@ -55,8 +151,9 @@ fn windows_entrypoint_plan_can_request_owned_data_removal_without_shell_script()
 
     let plan = build_windows_entrypoint_plan(&options);
 
-    assert!(plan.silent_shortcut.ends_with("Codex++.lnk"));
-    assert!(plan.manager_shortcut.ends_with("Codex++ 管理工具.lnk"));
+    let (silent_shortcut, manager_shortcut) = shortcut_names();
+    assert!(plan.silent_shortcut.ends_with(silent_shortcut));
+    assert!(plan.manager_shortcut.ends_with(manager_shortcut));
     assert!(plan.remove_owned_data);
 }
 
@@ -72,17 +169,28 @@ fn macos_bundle_metadata_contains_silent_and_manager_apps() {
     let silent = build_macos_app_bundle(&options, false);
     let manager = build_macos_app_bundle(&options, true);
 
-    assert!(silent.app_path.ends_with("Codex++.app"));
-    assert!(manager.app_path.ends_with("Codex++ 管理工具.app"));
-    assert!(silent.info_plist.contains("<string>Codex++</string>"));
+    let (silent_app, manager_app) = app_bundle_names();
+    assert!(silent.app_path.ends_with(silent_app));
+    assert!(manager.app_path.ends_with(manager_app));
+    assert!(silent.info_plist.contains("<string>U-API Connect</string>"));
     assert!(
         manager
             .info_plist
-            .contains("<string>Codex++ 管理工具</string>")
+            .contains("<string>U-API Connect 设置</string>")
     );
-    assert!(manager.info_plist.contains("<string>dreamskin</string>"));
-    assert!(manager.info_plist.contains("<string>codexplusplus</string>"));
-    assert!(!silent.info_plist.contains("<string>dreamskin</string>"));
+    assert!(manager.info_plist.contains("<string>uapiconnect</string>"));
+    assert!(!manager.info_plist.contains("<string>dreamskin</string>"));
+    assert!(!silent.info_plist.contains("<string>uapiconnect</string>"));
+    assert!(
+        silent
+            .info_plist
+            .contains("<key>LSUIElement</key>\n  <true/>")
+    );
+    assert!(
+        manager
+            .info_plist
+            .contains("<key>LSUIElement</key>\n  <false/>")
+    );
     assert_eq!(
         silent.binary_target_name.as_deref(),
         Some("codex-plus-plus")
@@ -99,10 +207,288 @@ fn macos_bundle_metadata_contains_silent_and_manager_apps() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_repair_leaves_complete_signed_bundles_byte_for_byte_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_root = temp.path().join("signed-apps");
+    let options = InstallOptions {
+        install_root: Some(install_root),
+        launcher_path: None,
+        manager_path: None,
+        remove_owned_data: false,
+    };
+    let silent = build_macos_app_bundle(&options, false);
+    let manager = build_macos_app_bundle(&options, true);
+    let (silent_info, silent_executable) = write_packaged_uapi_bundle(&silent, false);
+    let (manager_info, manager_executable) = write_packaged_uapi_bundle(&manager, true);
+    let tracked = [
+        silent_info,
+        silent_executable,
+        manager_info,
+        manager_executable,
+    ];
+    let before = tracked
+        .iter()
+        .map(|path| {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().ino(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let summary = repair_app_bundles(&options).unwrap();
+
+    assert!(summary.repaired.is_empty());
+    assert_eq!(summary.unchanged, ["U-API Connect", "U-API Connect 设置"]);
+    for (path, (bytes, inode)) in tracked.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+    }
+    assert!(
+        !silent
+            .app_path
+            .join("Contents/MacOS/codex-plus-plus")
+            .exists()
+    );
+    assert!(
+        !manager
+            .app_path
+            .join("Contents/MacOS/codex-plus-plus-manager")
+            .exists()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_repair_refuses_to_rewrite_a_damaged_signed_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_root = temp.path().join("signed-apps");
+    let options = InstallOptions {
+        install_root: Some(install_root),
+        launcher_path: None,
+        manager_path: None,
+        remove_owned_data: false,
+    };
+    let silent = build_macos_app_bundle(&options, false);
+    let manager = build_macos_app_bundle(&options, true);
+    let (silent_info, silent_executable) = write_packaged_uapi_bundle(&silent, false);
+    let (manager_info, manager_executable) = write_packaged_uapi_bundle(&manager, true);
+    let damaged_plist = std::fs::read_to_string(&manager_info)
+        .unwrap()
+        .replace("uapiconnect", "broken-scheme");
+    std::fs::write(&manager_info, damaged_plist).unwrap();
+    let tracked = [
+        silent_info,
+        silent_executable,
+        manager_info,
+        manager_executable,
+    ];
+    let before = tracked
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+
+    let error = repair_app_bundles(&options).unwrap_err().to_string();
+
+    assert!(error.contains("为避免破坏 macOS 应用签名"));
+    assert!(error.contains("未改写应用内容"));
+    assert!(error.contains("U-API Connect DMG"));
+    for (path, bytes) in tracked.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+    assert!(
+        !silent
+            .app_path
+            .join("Contents/MacOS/codex-plus-plus")
+            .exists()
+    );
+    assert!(
+        !manager
+            .app_path
+            .join("Contents/MacOS/codex-plus-plus-manager")
+            .exists()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_install_does_not_add_an_unsigned_companion_next_to_a_signed_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_root = temp.path().join("signed-apps");
+    let manager_source = temp.path().join("codex-plus-plus-manager");
+    write_fake_macho(&manager_source);
+    let options = InstallOptions {
+        install_root: Some(install_root),
+        launcher_path: None,
+        manager_path: Some(manager_source),
+        remove_owned_data: false,
+    };
+    let silent = build_macos_app_bundle(&options, false);
+    let manager = build_macos_app_bundle(&options, true);
+    let (silent_info, silent_executable) = write_packaged_uapi_bundle(&silent, false);
+    let before = [
+        std::fs::read(&silent_info).unwrap(),
+        std::fs::read(&silent_executable).unwrap(),
+    ];
+
+    let error = install_app_bundles(&options).unwrap_err().to_string();
+
+    assert!(error.contains("U-API Connect 设置"));
+    assert!(error.contains("U-API Connect DMG"));
+    assert_eq!(std::fs::read(silent_info).unwrap(), before[0]);
+    assert_eq!(std::fs::read(silent_executable).unwrap(), before[1]);
+    assert!(!manager.app_path.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_install_preserves_fresh_bundle_creation_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_root = temp.path().join("fresh-install-root");
+    let launcher_source = temp.path().join("codex-plus-plus");
+    let manager_source = temp.path().join("codex-plus-plus-manager");
+    write_fake_macho(&launcher_source);
+    write_fake_macho(&manager_source);
+    let options = InstallOptions {
+        install_root: Some(install_root),
+        launcher_path: Some(launcher_source),
+        manager_path: Some(manager_source),
+        remove_owned_data: false,
+    };
+    let silent = build_macos_app_bundle(&options, false);
+    let manager = build_macos_app_bundle(&options, true);
+
+    install_app_bundles(&options).unwrap();
+
+    assert!(silent.app_path.join("Contents/Info.plist").is_file());
+    assert!(
+        silent
+            .app_path
+            .join("Contents/MacOS/CodexPlusPlus")
+            .is_file()
+    );
+    assert!(
+        manager
+            .app_path
+            .join("Contents/MacOS/CodexPlusPlusManager")
+            .is_file()
+    );
+    assert!(
+        manager
+            .app_path
+            .join("Contents/MacOS/codex-plus-plus-manager")
+            .is_file()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_repair_can_build_unsigned_entrypoints_in_an_explicit_test_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_root = temp.path().join("unsigned-test-apps");
+    let sources = temp.path().join("sources");
+    let launcher_source = sources.join("codex-plus-plus");
+    let manager_source = sources.join("codex-plus-plus-manager");
+    write_fake_macho(&launcher_source);
+    write_fake_macho(&manager_source);
+    let options = InstallOptions {
+        install_root: Some(install_root),
+        launcher_path: Some(launcher_source.clone()),
+        manager_path: Some(manager_source.clone()),
+        remove_owned_data: false,
+    };
+    let silent = build_macos_app_bundle(&options, false);
+    let manager = build_macos_app_bundle(&options, true);
+
+    let first = repair_app_bundles(&options).unwrap();
+
+    assert_eq!(first.repaired, ["U-API Connect", "U-API Connect 设置"]);
+    assert!(first.unchanged.is_empty());
+    let silent_executable = silent.app_path.join("Contents/MacOS/CodexPlusPlus");
+    let manager_executable = manager.app_path.join("Contents/MacOS/CodexPlusPlusManager");
+    assert_eq!(
+        std::fs::read(silent.app_path.join("Contents/MacOS/codex-plus-plus")).unwrap(),
+        std::fs::read(launcher_source).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(
+            manager
+                .app_path
+                .join("Contents/MacOS/codex-plus-plus-manager")
+        )
+        .unwrap(),
+        std::fs::read(manager_source).unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&silent_executable).unwrap(),
+        silent.launch_script
+    );
+    assert_eq!(
+        std::fs::read_to_string(&manager_executable).unwrap(),
+        manager.launch_script
+    );
+    assert!(
+        std::fs::read_to_string(silent.app_path.join("Contents/Info.plist"))
+            .unwrap()
+            .contains("<key>LSUIElement</key>\n  <true/>")
+    );
+    let manager_plist =
+        std::fs::read_to_string(manager.app_path.join("Contents/Info.plist")).unwrap();
+    assert!(manager_plist.contains("<key>LSUIElement</key>\n  <false/>"));
+    assert!(manager_plist.contains("<string>uapiconnect</string>"));
+
+    let tracked = [silent_executable, manager_executable];
+    let before = tracked
+        .iter()
+        .map(|path| {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().ino(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let second = repair_app_bundles(&options).unwrap();
+    assert!(second.repaired.is_empty());
+    assert_eq!(second.unchanged, ["U-API Connect", "U-API Connect 设置"]);
+    for (path, (bytes, inode)) in tracked.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_repair_preflights_all_unsigned_sources_before_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_root = temp.path().join("unsigned-test-apps");
+    let manager_source = temp.path().join("codex-plus-plus-manager");
+    write_fake_macho(&manager_source);
+    let options = InstallOptions {
+        install_root: Some(install_root.clone()),
+        launcher_path: Some(temp.path().join("missing-launcher")),
+        manager_path: Some(manager_source),
+        remove_owned_data: false,
+    };
+
+    let error = repair_app_bundles(&options).unwrap_err().to_string();
+
+    assert!(error.contains("找不到可用于安全修复的应用二进制"));
+    assert!(!install_root.join("U-API Connect.app").exists());
+    assert!(!install_root.join("U-API Connect 设置.app").exists());
+}
+
 #[test]
 fn installer_exports_expected_two_entrypoint_names() {
-    assert_eq!(shortcut_names(), ("Codex++.lnk", "Codex++ 管理工具.lnk"));
-    assert_eq!(app_bundle_names(), ("Codex++.app", "Codex++ 管理工具.app"));
+    assert_eq!(
+        shortcut_names(),
+        ("U-API Connect.lnk", "U-API Connect 设置.lnk")
+    );
+    assert_eq!(
+        app_bundle_names(),
+        ("U-API Connect.app", "U-API Connect 设置.app")
+    );
 }
 
 #[test]
@@ -115,15 +501,19 @@ fn macos_dmg_includes_applications_shortcut_for_drag_install() {
 
 #[test]
 fn companion_binary_path_resolves_macos_silent_app_next_to_manager_app() {
-    let manager_exe = std::path::Path::new(
-        "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager",
-    );
+    let temp = tempfile::tempdir().unwrap();
+    let applications = temp.path().join("Applications");
+    let manager_exe = applications
+        .join("U-API Connect 设置.app")
+        .join("Contents/MacOS/CodexPlusPlusManager");
 
-    let companion = companion_binary_path_from_exe(manager_exe, SILENT_BINARY);
+    let companion = companion_binary_path_from_exe(&manager_exe, SILENT_BINARY);
 
     assert_eq!(
         companion,
-        std::path::PathBuf::from("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus")
+        applications
+            .join("U-API Connect.app")
+            .join("Contents/MacOS/CodexPlusPlus")
     );
     assert_ne!(
         companion,
@@ -135,26 +525,30 @@ fn companion_binary_path_resolves_macos_silent_app_next_to_manager_app() {
 
 #[test]
 fn companion_binary_path_resolves_macos_manager_app_next_to_silent_app() {
-    let silent_exe = std::path::Path::new("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus");
+    let temp = tempfile::tempdir().unwrap();
+    let applications = temp.path().join("Applications");
+    let silent_exe = applications
+        .join("U-API Connect.app")
+        .join("Contents/MacOS/CodexPlusPlus");
 
     let companion =
-        companion_binary_path_from_exe(silent_exe, codex_plus_core::install::MANAGER_BINARY);
+        companion_binary_path_from_exe(&silent_exe, codex_plus_core::install::MANAGER_BINARY);
 
     assert_eq!(
         companion,
-        std::path::PathBuf::from(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager"
-        )
+        applications
+            .join("U-API Connect 设置.app")
+            .join("Contents/MacOS/CodexPlusPlusManager")
     );
 }
 
 #[test]
 fn macos_companion_launch_uses_bundle_ids_from_app_translocation() {
     let manager_exe = std::path::Path::new(
-        "/private/var/folders/x/AppTranslocation/manager-id/d/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager",
+        "/private/var/folders/x/AppTranslocation/manager-id/d/U-API Connect 设置.app/Contents/MacOS/CodexPlusPlusManager",
     );
     let silent_exe = std::path::Path::new(
-        "/private/var/folders/x/AppTranslocation/silent-id/d/Codex++.app/Contents/MacOS/CodexPlusPlus",
+        "/private/var/folders/x/AppTranslocation/silent-id/d/U-API Connect.app/Contents/MacOS/CodexPlusPlus",
     );
 
     assert_eq!(
@@ -201,30 +595,26 @@ fn macos_companion_path_falls_back_to_workspace_release_launcher() {
 
 #[test]
 fn macos_bundle_does_not_wrap_the_bundle_executable_in_itself() {
+    let temp = tempfile::tempdir().unwrap();
+    let applications = temp.path().join("Applications");
+    let launcher_path = applications
+        .join("U-API Connect.app")
+        .join("Contents/MacOS/CodexPlusPlus");
+    let manager_path = applications
+        .join("U-API Connect 设置.app")
+        .join("Contents/MacOS/CodexPlusPlusManager");
     let options = InstallOptions {
-        install_root: Some("/Applications".into()),
-        launcher_path: Some("/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus".into()),
-        manager_path: Some(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager".into(),
-        ),
+        install_root: Some(applications),
+        launcher_path: Some(launcher_path.clone()),
+        manager_path: Some(manager_path.clone()),
         remove_owned_data: false,
     };
 
     let silent = build_macos_app_bundle(&options, false);
     let manager = build_macos_app_bundle(&options, true);
 
-    assert_eq!(
-        silent.binary_source,
-        Some(std::path::PathBuf::from(
-            "/Applications/Codex++.app/Contents/MacOS/CodexPlusPlus"
-        ))
-    );
-    assert_eq!(
-        manager.binary_source,
-        Some(std::path::PathBuf::from(
-            "/Applications/Codex++ 管理工具.app/Contents/MacOS/CodexPlusPlusManager"
-        ))
-    );
+    assert_eq!(silent.binary_source, Some(launcher_path));
+    assert_eq!(manager.binary_source, Some(manager_path));
     assert!(silent.launch_script.contains("$DIR/codex-plus-plus"));
     assert!(
         manager

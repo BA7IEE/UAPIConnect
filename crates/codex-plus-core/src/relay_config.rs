@@ -1,8 +1,12 @@
 use anyhow::Context;
+use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
@@ -18,6 +22,8 @@ const RELAY_PROVIDER: &str = "custom";
 const CONTEXT_TABLE_NAMES: [&str; 2] = ["mcp_servers", "plugins"];
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
 const CC_SWITCH_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
+const EXTERNAL_RESPONSES_CATALOG_POINTER_MARKER: &str =
+    "codex-plus-external-responses-catalog-copy";
 const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_chat_base_url";
 const PROVIDER_SPECIFIC_COMMON_ROOT_KEYS: &[&str] = &[
     "model",
@@ -37,6 +43,97 @@ const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "oss",
     "ollama-chat",
 ];
+const LIVE_FILES_TRANSACTION_LOCK: &str = ".codex-plus-live-files.lock";
+
+thread_local! {
+    static ACTIVE_LIVE_FILE_TRANSACTIONS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Serializes every config/auth/catalog transaction across manager and launcher processes.
+/// Nested calls on the same thread are intentional: high-level snapshot/rollback code calls
+/// the public apply helpers while already holding this lock.
+pub(crate) fn with_live_files_transaction<T>(
+    home: &Path,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("创建 Codex 配置目录失败：{}", home.display()))?;
+    let home_key = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if ACTIVE_LIVE_FILE_TRANSACTIONS.with(|active| active.borrow().contains(&home_key)) {
+        return operation();
+    }
+
+    let process_lock = live_files_process_lock(&home_key);
+    let _process_guard = process_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock_path = home_key.join(LIVE_FILES_TRANSACTION_LOCK);
+    let lock_file = open_live_files_lock(&lock_path)?;
+    FileExt::lock_exclusive(&lock_file)
+        .with_context(|| format!("锁定 Codex 配置事务失败：{}", lock_path.display()))?;
+    let _active_guard = ActiveLiveTransaction::enter(home_key);
+    operation()
+}
+
+fn live_files_process_lock(home: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(home).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(home.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+fn open_live_files_lock(path: &Path) -> anyhow::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        options.mode(0o600);
+        let file = options
+            .open(path)
+            .with_context(|| format!("打开 Codex 配置事务锁失败：{}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("收紧 Codex 配置事务锁权限失败：{}", path.display()))?;
+        return Ok(file);
+    }
+    #[cfg(not(unix))]
+    options
+        .open(path)
+        .with_context(|| format!("打开 Codex 配置事务锁失败：{}", path.display()))
+}
+
+struct ActiveLiveTransaction {
+    home: PathBuf,
+}
+
+impl ActiveLiveTransaction {
+    fn enter(home: PathBuf) -> Self {
+        ACTIVE_LIVE_FILE_TRANSACTIONS.with(|active| active.borrow_mut().push(home.clone()));
+        Self { home }
+    }
+}
+
+impl Drop for ActiveLiveTransaction {
+    fn drop(&mut self) {
+        ACTIVE_LIVE_FILE_TRANSACTIONS.with(|active| {
+            let mut active = active.borrow_mut();
+            let position = active
+                .iter()
+                .rposition(|home| home == &self.home)
+                .expect("live transaction guard must have a matching entry");
+            active.remove(position);
+        });
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,25 +207,27 @@ pub fn default_relay_status() -> RelayStatus {
 }
 
 pub fn set_codex_goals_feature_in_home(home: &Path, enabled: bool) -> anyhow::Result<()> {
-    std::fs::create_dir_all(home)?;
-    let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let updated = match parse_toml_document(&existing) {
-        Ok(mut doc) => {
-            if enabled {
-                let features = table_mut_or_insert(&mut doc, "features")?;
-                features["goals"] = toml_edit::value(true);
-            } else if let Some(features) = table_mut_if_exists(&mut doc, "features") {
-                features.remove("goals");
-                if features.is_empty() {
-                    doc.as_table_mut().remove("features");
+    with_live_files_transaction(home, || {
+        std::fs::create_dir_all(home)?;
+        let config_path = home.join("config.toml");
+        let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+        let updated = match parse_toml_document(&existing) {
+            Ok(mut doc) => {
+                if enabled {
+                    let features = table_mut_or_insert(&mut doc, "features")?;
+                    features["goals"] = toml_edit::value(true);
+                } else if let Some(features) = table_mut_if_exists(&mut doc, "features") {
+                    features.remove("goals");
+                    if features.is_empty() {
+                        doc.as_table_mut().remove("features");
+                    }
                 }
+                ensure_trailing_newline(doc.to_string())
             }
-            ensure_trailing_newline(doc.to_string())
-        }
-        Err(_) => set_codex_goals_feature_text_fallback(&existing, enabled),
-    };
-    crate::settings::atomic_write(&config_path, updated.as_bytes())
+            Err(_) => set_codex_goals_feature_text_fallback(&existing, enabled),
+        };
+        crate::settings::atomic_write(&config_path, updated.as_bytes())
+    })
 }
 
 fn set_codex_goals_feature_text_fallback(existing: &str, enabled: bool) -> String {
@@ -329,35 +428,38 @@ pub fn apply_relay_config_to_home_with_session_provider(
     proxy_port: u16,
     session_provider: RelaySessionProvider,
 ) -> anyhow::Result<RelayApplyResult> {
-    let base_url = base_url.trim();
-    if base_url.is_empty() {
-        anyhow::bail!("中转 Base URL 不能为空");
-    }
-    let bearer_token = bearer_token.trim();
-    if bearer_token.is_empty() {
-        anyhow::bail!("中转 Key 不能为空");
-    }
-    if session_provider == RelaySessionProvider::Openai && protocol != RelayProtocol::Responses {
-        anyhow::bail!("OpenAI 会话身份仅支持 Responses API");
-    }
-    let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
-    let updated = upsert_model_provider_config_with_session_provider(
-        "",
-        &codex_base_url,
-        bearer_token,
-        true,
-        session_provider,
-    )?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
-    let backup_path =
-        write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
-    let status = relay_config_status_from_home(home);
-    Ok(RelayApplyResult {
-        config_path: status.config_path,
-        backup_path,
-        configured: status.configured,
+    with_live_files_transaction(home, || {
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            anyhow::bail!("中转 Base URL 不能为空");
+        }
+        let bearer_token = bearer_token.trim();
+        if bearer_token.is_empty() {
+            anyhow::bail!("中转 Key 不能为空");
+        }
+        if session_provider == RelaySessionProvider::Openai && protocol != RelayProtocol::Responses
+        {
+            anyhow::bail!("OpenAI 会话身份仅支持 Responses API");
+        }
+        let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
+        let updated = upsert_model_provider_config_with_session_provider(
+            "",
+            &codex_base_url,
+            bearer_token,
+            true,
+            session_provider,
+        )?;
+        let auth_contents = serde_json::to_string_pretty(&json!({
+            "OPENAI_API_KEY": bearer_token
+        }))?;
+        let backup_path =
+            write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
+        let status = relay_config_status_from_home(home);
+        Ok(RelayApplyResult {
+            config_path: status.config_path,
+            backup_path,
+            configured: status.configured,
+        })
     })
 }
 
@@ -380,19 +482,21 @@ pub fn apply_relay_files_to_home(
     config_contents: &str,
     auth_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    if config_contents.trim().is_empty() {
-        anyhow::bail!("config.toml 内容不能为空");
-    }
-    std::fs::create_dir_all(home)?;
+    with_live_files_transaction(home, || {
+        if config_contents.trim().is_empty() {
+            anyhow::bail!("config.toml 内容不能为空");
+        }
+        std::fs::create_dir_all(home)?;
 
-    let backup_path =
-        write_codex_live_atomic(home, Some(config_contents), Some(auth_contents.as_bytes()))?;
+        let backup_path =
+            write_codex_live_atomic(home, Some(config_contents), Some(auth_contents.as_bytes()))?;
 
-    let status = relay_config_status_from_home(home);
-    Ok(RelayApplyResult {
-        config_path: status.config_path,
-        backup_path,
-        configured: status.configured,
+        let status = relay_config_status_from_home(home);
+        Ok(RelayApplyResult {
+            config_path: status.config_path,
+            backup_path,
+            configured: status.configured,
+        })
     })
 }
 
@@ -402,8 +506,11 @@ pub fn apply_relay_files_to_home_with_common(
     auth_contents: &str,
     common_config_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    let config_contents = merge_common_config_into_config(config_contents, common_config_contents)?;
-    apply_relay_files_to_home(home, &config_contents, auth_contents)
+    with_live_files_transaction(home, || {
+        let config_contents =
+            merge_common_config_into_config(config_contents, common_config_contents)?;
+        apply_relay_files_to_home(home, &config_contents, auth_contents)
+    })
 }
 
 pub fn apply_relay_files_to_home_with_context(
@@ -414,13 +521,22 @@ pub fn apply_relay_files_to_home_with_context(
     context_window: &str,
     auto_compact_limit: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    let selected_common = prepare_common_config_for_apply(common_config_contents)?;
-    let config_with_common = merge_common_config_into_config(config_contents, &selected_common)?;
-    let config_with_common =
-        preserve_unmanaged_live_context_entries(home, &config_with_common, common_config_contents)?;
-    let config_with_limits =
-        apply_context_limits_to_config(&config_with_common, context_window, auto_compact_limit)?;
-    apply_relay_files_to_home(home, &config_with_limits, auth_contents)
+    with_live_files_transaction(home, || {
+        let selected_common = prepare_common_config_for_apply(common_config_contents)?;
+        let config_with_common =
+            merge_common_config_into_config(config_contents, &selected_common)?;
+        let config_with_common = preserve_unmanaged_live_context_entries(
+            home,
+            &config_with_common,
+            common_config_contents,
+        )?;
+        let config_with_limits = apply_context_limits_to_config(
+            &config_with_common,
+            context_window,
+            auto_compact_limit,
+        )?;
+        apply_relay_files_to_home(home, &config_with_limits, auth_contents)
+    })
 }
 
 pub fn apply_relay_profile_files_to_home_with_context(
@@ -428,6 +544,16 @@ pub fn apply_relay_profile_files_to_home_with_context(
     profile: &RelayProfile,
     common_config_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
+    with_live_files_transaction(home, || {
+        apply_relay_profile_files_to_home_with_context_locked(home, profile, common_config_contents)
+    })
+}
+
+fn apply_relay_profile_files_to_home_with_context_locked(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+) -> anyhow::Result<RelayApplyResult> {
     let selected_common = if profile.use_common_config {
         prepare_common_config_for_apply(common_config_contents)?
     } else {
@@ -442,9 +568,13 @@ pub fn apply_relay_profile_files_to_home_with_context(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
-    let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-    apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+    with_managed_catalog_rollback(home, profile, || {
+        let config_with_catalog =
+            apply_model_catalog_to_config(home, profile, &config_with_limits)?;
+        let compatible_config =
+            apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+        apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+    })
 }
 
 pub fn apply_relay_profile_to_home_with_switch_rules(
@@ -452,6 +582,16 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     profile: &RelayProfile,
     common_config_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
+    with_live_files_transaction(home, || {
+        apply_relay_profile_to_home_with_switch_rules_locked(home, profile, common_config_contents)
+    })
+}
+
+fn apply_relay_profile_to_home_with_switch_rules_locked(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+) -> anyhow::Result<RelayApplyResult> {
     let selected_common = if profile.use_common_config {
         prepare_common_config_for_apply(common_config_contents)?
     } else {
@@ -466,18 +606,36 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
-    let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+    with_managed_catalog_rollback(home, profile, || {
+        let config_with_catalog =
+            apply_model_catalog_to_config(home, profile, &config_with_limits)?;
+        let compatible_config =
+            apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
-    if profile.relay_mode == crate::settings::RelayMode::PureApi {
-        apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
-    } else {
-        let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
-        apply_relay_files_to_home(home, &compatible_config, &auth_contents)
-    }
+        if profile.relay_mode == crate::settings::RelayMode::PureApi {
+            apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+        } else {
+            let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
+            apply_relay_files_to_home(home, &compatible_config, &auth_contents)
+        }
+    })
 }
 
 pub fn apply_relay_profile_config_to_home_with_context(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+) -> anyhow::Result<RelayApplyResult> {
+    with_live_files_transaction(home, || {
+        apply_relay_profile_config_to_home_with_context_locked(
+            home,
+            profile,
+            common_config_contents,
+        )
+    })
+}
+
+fn apply_relay_profile_config_to_home_with_context_locked(
     home: &Path,
     profile: &RelayProfile,
     common_config_contents: &str,
@@ -494,12 +652,68 @@ pub fn apply_relay_profile_config_to_home_with_context(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    let config_with_catalog = apply_model_catalog_to_config(home, profile, &config_with_limits)?;
-    let compatible_config = apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-    apply_relay_config_file_to_home(home, &compatible_config)
+    with_managed_catalog_rollback(home, profile, || {
+        let config_with_catalog =
+            apply_model_catalog_to_config(home, profile, &config_with_limits)?;
+        let compatible_config =
+            apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+        apply_relay_config_file_to_home(home, &compatible_config)
+    })
+}
+
+#[derive(Debug)]
+struct ManagedCatalogSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+impl ManagedCatalogSnapshot {
+    fn capture(home: &Path, profile_id: &str) -> anyhow::Result<Self> {
+        let path = home.join(managed_model_catalog_relative_path(profile_id));
+        Ok(Self {
+            contents: read_optional_bytes(&path)?,
+            path,
+        })
+    }
+
+    fn restore_if_changed(&self) -> anyhow::Result<()> {
+        if read_optional_bytes(&self.path)? == self.contents {
+            return Ok(());
+        }
+        restore_optional_file(&self.path, self.contents.as_deref())
+    }
+}
+
+fn with_managed_catalog_rollback<T>(
+    home: &Path,
+    profile: &RelayProfile,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let snapshot = ManagedCatalogSnapshot::capture(home, &profile.id)
+        .context("读取目标供应商 model catalog 失败")?;
+    match operation() {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if let Err(restore_error) = snapshot.restore_if_changed() {
+                anyhow::bail!(
+                    "应用供应商配置失败：{error}；回滚不完整：model catalog={restore_error}"
+                );
+            }
+            Err(error)
+        }
+    }
 }
 
 pub fn apply_relay_config_file_to_home(
+    home: &Path,
+    config_contents: &str,
+) -> anyhow::Result<RelayApplyResult> {
+    with_live_files_transaction(home, || {
+        apply_relay_config_file_to_home_locked(home, config_contents)
+    })
+}
+
+fn apply_relay_config_file_to_home_locked(
     home: &Path,
     config_contents: &str,
 ) -> anyhow::Result<RelayApplyResult> {
@@ -546,35 +760,38 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
     proxy_port: u16,
     session_provider: RelaySessionProvider,
 ) -> anyhow::Result<RelayApplyResult> {
-    let base_url = base_url.trim();
-    if base_url.is_empty() {
-        anyhow::bail!("中转 Base URL 不能为空");
-    }
-    let bearer_token = bearer_token.trim();
-    if bearer_token.is_empty() {
-        anyhow::bail!("中转 Key 不能为空");
-    }
-    if session_provider == RelaySessionProvider::Openai && protocol != RelayProtocol::Responses {
-        anyhow::bail!("OpenAI 会话身份仅支持 Responses API");
-    }
-    let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
-    let updated = upsert_model_provider_config_with_session_provider(
-        "",
-        &codex_base_url,
-        bearer_token,
-        false,
-        session_provider,
-    )?;
-    let auth_contents = serde_json::to_string_pretty(&json!({
-        "OPENAI_API_KEY": bearer_token
-    }))?;
-    let backup_path =
-        write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
-    let status = relay_config_status_from_home(home);
-    Ok(RelayApplyResult {
-        config_path: status.config_path,
-        backup_path,
-        configured: status.configured,
+    with_live_files_transaction(home, || {
+        let base_url = base_url.trim();
+        if base_url.is_empty() {
+            anyhow::bail!("中转 Base URL 不能为空");
+        }
+        let bearer_token = bearer_token.trim();
+        if bearer_token.is_empty() {
+            anyhow::bail!("中转 Key 不能为空");
+        }
+        if session_provider == RelaySessionProvider::Openai && protocol != RelayProtocol::Responses
+        {
+            anyhow::bail!("OpenAI 会话身份仅支持 Responses API");
+        }
+        let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
+        let updated = upsert_model_provider_config_with_session_provider(
+            "",
+            &codex_base_url,
+            bearer_token,
+            false,
+            session_provider,
+        )?;
+        let auth_contents = serde_json::to_string_pretty(&json!({
+            "OPENAI_API_KEY": bearer_token
+        }))?;
+        let backup_path =
+            write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()))?;
+        let status = relay_config_status_from_home(home);
+        Ok(RelayApplyResult {
+            config_path: status.config_path,
+            backup_path,
+            configured: status.configured,
+        })
     })
 }
 
@@ -726,6 +943,15 @@ pub fn clear_relay_config_to_home(home: &Path) -> anyhow::Result<RelayApplyResul
 }
 
 pub fn clear_relay_config_to_home_with_auth(
+    home: &Path,
+    auth_contents: Option<&str>,
+) -> anyhow::Result<RelayApplyResult> {
+    with_live_files_transaction(home, || {
+        clear_relay_config_to_home_with_auth_locked(home, auth_contents)
+    })
+}
+
+fn clear_relay_config_to_home_with_auth_locked(
     home: &Path,
     auth_contents: Option<&str>,
 ) -> anyhow::Result<RelayApplyResult> {
@@ -1204,7 +1430,7 @@ fn write_codex_live_atomic(
     let mut auth_written = false;
 
     if let Some(auth_bytes) = auth_bytes {
-        if let Err(error) = crate::settings::atomic_write(&auth_path, auth_bytes) {
+        if let Err(error) = crate::settings::atomic_write_private(&auth_path, auth_bytes) {
             return Err(error.context("写入 auth.json 失败"));
         }
         auth_written = true;
@@ -1212,15 +1438,49 @@ fn write_codex_live_atomic(
 
     if let Some(config_text) = config_text {
         if let Err(error) = crate::settings::atomic_write(&config_path, config_text.as_bytes()) {
-            if auth_written {
-                let _ = restore_optional_file(&auth_path, old_auth.as_deref());
+            let rollback_error = restore_live_files_after_config_failure(
+                &config_path,
+                old_config.as_deref(),
+                &auth_path,
+                old_auth.as_deref(),
+                auth_written,
+            )
+            .err();
+            if let Some(rollback_error) = rollback_error {
+                anyhow::bail!(
+                    "写入 config.toml 失败：{error}；Codex 实时文件回滚不完整：{rollback_error}"
+                );
             }
-            let _ = restore_optional_file(&config_path, old_config.as_deref());
-            return Err(error.context("写入 config.toml 失败"));
+            return Err(error.context("写入 config.toml 失败，已恢复原配置"));
         }
     }
 
     Ok(backup_path)
+}
+
+fn restore_live_files_after_config_failure(
+    config_path: &Path,
+    old_config: Option<&[u8]>,
+    auth_path: &Path,
+    old_auth: Option<&[u8]>,
+    auth_was_written: bool,
+) -> anyhow::Result<()> {
+    let auth_error = auth_was_written
+        .then(|| restore_optional_private_file(auth_path, old_auth).err())
+        .flatten();
+    let config_error = restore_optional_file(config_path, old_config).err();
+    if auth_error.is_none() && config_error.is_none() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "auth.json={}，config.toml={}",
+        auth_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string()),
+        config_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string())
+    )
 }
 
 fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::Result<String> {
@@ -1626,11 +1886,17 @@ fn parse_optional_positive_u64(value: &str, label: &str) -> anyhow::Result<Optio
     if trimmed.is_empty() {
         return Ok(None);
     }
+    if !trimmed.chars().all(|char| char.is_ascii_digit()) {
+        anyhow::bail!("{label}必须是正整数");
+    }
     let parsed = trimmed
         .parse::<u64>()
-        .with_context(|| format!("{label}必须是正整数"))?;
+        .with_context(|| format!("{label}数值过大，不能超过 {}", i64::MAX))?;
     if parsed == 0 {
         anyhow::bail!("{label}必须大于 0");
+    }
+    if i64::try_from(parsed).is_err() {
+        anyhow::bail!("{label}数值过大，不能超过 {}", i64::MAX);
     }
     Ok(Some(parsed))
 }
@@ -1642,12 +1908,46 @@ fn apply_context_limits_to_config(
 ) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(config_text)?;
     if let Some(value) = parse_optional_positive_u64(context_window, "上下文大小")? {
-        doc["model_context_window"] = toml_edit::value(value as i64);
+        doc["model_context_window"] =
+            toml_edit::value(i64::try_from(value).context("上下文大小超出 TOML 整数范围")?);
     }
     if let Some(value) = parse_optional_positive_u64(auto_compact_limit, "压缩上下文大小")? {
-        doc["model_auto_compact_token_limit"] = toml_edit::value(value as i64);
+        doc["model_auto_compact_token_limit"] =
+            toml_edit::value(i64::try_from(value).context("压缩上下文大小超出 TOML 整数范围")?);
     }
     Ok(normalize_optional_toml(doc))
+}
+
+fn profile_model_list_and_windows(
+    profile: &RelayProfile,
+) -> anyhow::Result<(String, std::collections::HashMap<String, String>)> {
+    let (model_list, model_windows) =
+        if profile.model_windows.trim().is_empty() && profile.model_list.contains('[') {
+            crate::model_suffix::migrate_model_list_with_suffixes(&profile.model_list)
+        } else if profile.model_windows.trim().is_empty() {
+            (profile.model_list.clone(), std::collections::HashMap::new())
+        } else {
+            let model_windows = serde_json::from_str(&profile.model_windows)
+                .context("每模型上下文配置不是有效 JSON 对象")?;
+            (profile.model_list.clone(), model_windows)
+        };
+
+    for (model, token) in &model_windows {
+        let parsed = crate::model_suffix::parse_window_token(token).ok_or_else(|| {
+            anyhow::anyhow!(
+                "模型 {model} 的上下文大小 {token:?} 无效，必须是大于 0 且不超过 {} 的整数或 K/M 格式",
+                i64::MAX
+            )
+        })?;
+        if i64::try_from(parsed).is_err() {
+            anyhow::bail!(
+                "模型 {model} 的上下文大小 {token:?} 数值过大，不能超过 {}",
+                i64::MAX
+            );
+        }
+    }
+
+    Ok((model_list, model_windows))
 }
 
 fn apply_model_catalog_to_config(
@@ -1655,23 +1955,36 @@ fn apply_model_catalog_to_config(
     profile: &RelayProfile,
     config_text: &str,
 ) -> anyhow::Result<String> {
-    let catalog_relative = format!(
-        "model-catalogs/{}.json",
-        sanitize_catalog_filename(&profile.id)
-    );
+    let catalog_relative = managed_model_catalog_relative_path(&profile.id);
     let mut config_text = config_text.to_string();
     let custom_responses = custom_responses_provider(&config_text);
     // Catalog capabilities must follow the effective config, not stale profile URLs.
     let official_deepseek_responses =
         uses_official_deepseek_responses_for_config(profile, &config_text);
+    // 即使后续沿用用户的外部 catalog，也要先校验 profile 中的结构化配置，
+    // 避免损坏的 JSON 被静默当成“没有逐模型窗口”。
+    let (model_list, model_windows) = profile_model_list_and_windows(profile)?;
+    let entries =
+        crate::model_suffix::collect_catalog_entries(&model_list, &model_windows, &profile.model);
+    let has_per_model_window = entries.iter().any(|entry| entry.suffix_window.is_some());
+    let needs_managed_catalog = entries.iter().any(|entry| {
+        entry.suffix_window.is_some()
+            || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
+            || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
+    });
     // 用户已手写 model_catalog_json 指针时保留，不覆盖（保 preserves_user_model_catalog_json 测试）
-    // 仅当现有指针指向本 profile 自己生成的 catalog 时才重新生成。
+    // 仅当现有指针指向 Codex++ 管理的 catalog 时才重新生成或移除。
     // cc-switch 的固定文件名属于已知的其他管理器投影，不视为用户手写 catalog；
     // 切换到 Codex++ profile 时应接管，否则旧 catalog 会继续覆盖本 profile 的模型元数据。
     if let Some(existing) = root_key_string(&config_text, "model_catalog_json") {
         if existing != catalog_relative {
-            if is_cc_switch_model_catalog(&existing) {
-                config_text = remove_root_key(&config_text, "model_catalog_json");
+            if is_cc_switch_model_catalog(&existing)
+                || is_codex_plus_managed_model_catalog(home, &existing)
+            {
+                config_text = remove_external_responses_catalog_pointer_marker(&remove_root_key(
+                    &config_text,
+                    "model_catalog_json",
+                ));
             } else if official_deepseek_responses {
                 return Ok(config_text.to_string());
             } else if custom_responses
@@ -1679,7 +1992,9 @@ fn apply_model_catalog_to_config(
             {
                 let mut doc = parse_toml_document(&config_text)?;
                 doc["model_catalog_json"] = toml_edit::value(catalog_relative);
-                return Ok(normalize_optional_toml(doc));
+                return Ok(mark_external_responses_catalog_pointer(
+                    &normalize_optional_toml(doc),
+                ));
             } else {
                 return Ok(config_text);
             }
@@ -1693,31 +2008,32 @@ fn apply_model_catalog_to_config(
             && copy_standard_responses_catalog(home, &external_catalog, &catalog_relative)?
         {
             doc["model_catalog_json"] = toml_edit::value(catalog_relative);
+            return Ok(mark_external_responses_catalog_pointer(
+                &normalize_optional_toml(doc),
+            ));
         } else {
             doc["model_catalog_json"] = toml_edit::value(external_catalog);
         }
         return Ok(normalize_optional_toml(doc));
     }
-    let (model_list, model_windows): (String, std::collections::HashMap<String, String>) =
-        if profile.model_windows.trim().is_empty() && profile.model_list.contains('[') {
-            crate::model_suffix::migrate_model_list_with_suffixes(&profile.model_list)
-        } else {
-            (
-                profile.model_list.clone(),
-                serde_json::from_str(&profile.model_windows).unwrap_or_default(),
-            )
-        };
-    let entries =
-        crate::model_suffix::collect_catalog_entries(&model_list, &model_windows, &profile.model);
     // Known bundled metadata entries need a catalog even without a user-supplied window.
-    if !entries.iter().any(|entry| {
-        entry.suffix_window.is_some()
-            || crate::model_suffix::requires_bundled_metadata_catalog(&entry.slug)
-            || (official_deepseek_responses && entry.slug.starts_with("deepseek-v4-"))
-    }) {
-        return Ok(config_text);
+    if !needs_managed_catalog {
+        // 同一 profile 曾经生成过 catalog、后来清空逐模型窗口时，必须同步撤掉指针；
+        // JSON 文件可以保留作历史产物，但 Codex 不会再加载它。
+        if root_key_string(&config_text, "model_catalog_json").as_deref()
+            == Some(catalog_relative.as_str())
+            && !has_valid_external_responses_catalog_copy(home, &catalog_relative, &config_text)
+        {
+            config_text = remove_external_responses_catalog_pointer_marker(&remove_root_key(
+                &config_text,
+                "model_catalog_json",
+            ));
+        }
+        return Ok(ensure_trailing_newline(config_text));
     }
-    let fallback = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
+    let fallback_window = parse_optional_positive_u64(&profile.context_window, "上下文大小")?;
+    let fallback_auto_compact =
+        parse_optional_positive_u64(&profile.auto_compact_limit, "压缩上下文大小")?;
     let catalog_path = home.join(&catalog_relative);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1726,15 +2042,29 @@ fn apply_model_catalog_to_config(
     // profiles and custom Chat Completions retain the model template's original Lite behavior.
     let catalog_json = crate::model_suffix::build_model_catalog_json_with_capabilities(
         &entries,
-        fallback,
+        fallback_window,
+        fallback_auto_compact,
         None,
         custom_responses.then_some(false),
         official_deepseek_responses,
     );
-    std::fs::write(&catalog_path, catalog_json)?;
+    crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
     let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_relative);
-    Ok(normalize_optional_toml(doc))
+    if has_per_model_window {
+        // 顶层值优先级高于 catalog 条目。profile 单值已实体化到每条模型后，
+        // 移除这些受管 override，才能让逐模型窗口真正生效。
+        // profile 字段为空时保留 raw TOML 中的手写值，尊重显式用户配置。
+        if !profile.context_window.trim().is_empty() {
+            doc.as_table_mut().remove("model_context_window");
+        }
+        if !profile.auto_compact_limit.trim().is_empty() {
+            doc.as_table_mut().remove("model_auto_compact_token_limit");
+        }
+    }
+    Ok(remove_external_responses_catalog_pointer_marker(
+        &normalize_optional_toml(doc),
+    ))
 }
 
 pub(crate) fn uses_official_deepseek_responses(profile: &RelayProfile) -> bool {
@@ -1891,8 +2221,59 @@ fn copy_standard_responses_catalog(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(target, serde_json::to_string_pretty(&catalog)?)?;
+    let catalog_json = serde_json::to_string_pretty(&catalog)?;
+    crate::settings::atomic_write(&target, catalog_json.as_bytes())?;
     Ok(true)
+}
+
+fn mark_external_responses_catalog_pointer(config_text: &str) -> String {
+    if is_external_responses_catalog_pointer(config_text) {
+        return ensure_trailing_newline(config_text.to_string());
+    }
+    let mut in_root = true;
+    let mut marked = false;
+    let mut lines = Vec::new();
+    for line in config_text.lines() {
+        if line.trim_start().starts_with('[') {
+            in_root = false;
+        }
+        if !marked && in_root && line.trim_start().starts_with("model_catalog_json") {
+            lines.push(format!("# {EXTERNAL_RESPONSES_CATALOG_POINTER_MARKER}"));
+            marked = true;
+        }
+        lines.push(line.to_string());
+    }
+    let lines = lines.join("\n");
+    ensure_trailing_newline(lines)
+}
+
+fn is_external_responses_catalog_pointer(config_text: &str) -> bool {
+    config_text
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .any(|line| line.trim() == format!("# {EXTERNAL_RESPONSES_CATALOG_POINTER_MARKER}"))
+}
+
+fn remove_external_responses_catalog_pointer_marker(config_text: &str) -> String {
+    config_text
+        .lines()
+        .filter(|line| line.trim() != format!("# {EXTERNAL_RESPONSES_CATALOG_POINTER_MARKER}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn has_valid_external_responses_catalog_copy(
+    home: &Path,
+    catalog_relative: &str,
+    config_text: &str,
+) -> bool {
+    if !is_external_responses_catalog_pointer(config_text) {
+        return false;
+    }
+    std::fs::read_to_string(home.join(catalog_relative))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .is_some_and(|catalog| catalog.get("models").and_then(Value::as_array).is_some())
 }
 
 fn live_external_model_catalog(home: &Path) -> Option<String> {
@@ -1917,12 +2298,6 @@ fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
     let normalized = path.trim().replace('\\', "/");
     let relative = normalized.trim_start_matches("./");
     if relative.to_ascii_lowercase().starts_with("model-catalogs/") {
-        return true;
-    }
-    let normalized_lower = normalized.to_ascii_lowercase();
-    if normalized_lower.contains("/model-catalogs/")
-        || normalized_lower.ends_with("/model-catalogs")
-    {
         return true;
     }
     let managed_root = home
@@ -1952,13 +2327,45 @@ fn sanitize_catalog_filename(id: &str) -> String {
         .collect()
 }
 
+/// 返回单个 profile 由 Codex++ 管理的 catalog 相对路径。
+///
+/// 事务调用方用它精确快照目标文件；不要据此遍历或批量处理 catalog 目录。
+pub fn managed_model_catalog_relative_path(profile_id: &str) -> String {
+    format!(
+        "model-catalogs/{}.json",
+        sanitize_catalog_filename(profile_id)
+    )
+}
+
 fn sync_context_limits_from_config(profile: &mut RelayProfile, config_text: &str) {
+    // 有逐模型窗口时，live 顶层值可能是用户手写 override，不能在 backfill 时
+    // 自动认领为 profile 单值；否则下一次 apply 会把它当作受管字段删除。
+    if profile_has_per_model_windows(profile) {
+        return;
+    }
     if let Some(value) = root_positive_int_string(config_text, "model_context_window") {
         profile.context_window = value;
     }
     if let Some(value) = root_positive_int_string(config_text, "model_auto_compact_token_limit") {
         profile.auto_compact_limit = value;
     }
+}
+
+fn profile_has_per_model_windows(profile: &RelayProfile) -> bool {
+    let serialized = profile.model_windows.trim();
+    if !serialized.is_empty() {
+        return match serde_json::from_str::<Value>(serialized) {
+            Ok(Value::Object(windows)) => !windows.is_empty(),
+            // 损坏的结构化值会在 apply 时给出明确错误；backfill 先按“存在”保守处理，
+            // 避免顺手改变顶层键的所有权。
+            Ok(_) | Err(_) => true,
+        };
+    }
+
+    profile
+        .model_list
+        .split(['\r', '\n', ','])
+        .any(|model| crate::model_suffix::parse_model_suffix(model).1.is_some())
 }
 
 fn root_positive_int_string(config_text: &str, key: &str) -> Option<String> {
@@ -2888,26 +3295,81 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
     }
 }
 
+fn restore_optional_private_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result<()> {
+    match contents {
+        Some(contents) => crate::settings::atomic_write_private(path, contents),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
 fn create_live_backup(
     home: &Path,
     config: Option<&[u8]>,
     auth: Option<&[u8]>,
 ) -> anyhow::Result<Option<String>> {
+    // 固定发行版已经用内存快照完成同步回滚，并把长期凭证放在系统凭证库
+    // 或加密快照中。继续复制 auth.json 会留下无法轮换的明文 token/key。
+    let auth = if crate::distribution::FIXED_PROVIDER_EDITION {
+        None
+    } else {
+        auth
+    };
     if config.is_none() && auth.is_none() {
         return Ok(None);
     }
 
-    let backup_dir = home
-        .join("backups")
-        .join(format!("codex-plus-live-{}", timestamp_millis()));
+    let backup_root = home.join("backups");
+    std::fs::create_dir_all(&backup_root)?;
+    restrict_backup_directory_permissions(&backup_root)?;
+    let backup_dir = backup_root.join(format!("codex-plus-live-{}", timestamp_millis()));
     std::fs::create_dir_all(&backup_dir)?;
+    restrict_backup_directory_permissions(&backup_dir)?;
     if let Some(config) = config {
-        std::fs::write(backup_dir.join("config.toml"), config)?;
+        write_backup_file(&backup_dir.join("config.toml"), config)?;
     }
     if let Some(auth) = auth {
-        std::fs::write(backup_dir.join("auth.json"), auth)?;
+        write_backup_file(&backup_dir.join("auth.json"), auth)?;
     }
     Ok(Some(backup_dir.to_string_lossy().to_string()))
+}
+
+fn write_backup_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    std::fs::write(path, contents)?;
+    restrict_backup_file_permissions(path)
+}
+
+#[cfg(unix)]
+fn restrict_backup_directory_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("收紧备份目录权限失败：{}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_backup_directory_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_backup_file_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .with_context(|| format!("收紧备份文件权限失败：{}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_backup_file_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn timestamp_millis() -> u128 {
@@ -3028,6 +3490,69 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_files_transaction_is_reentrant_and_serializes_threads() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first_home = home.clone();
+        let first = std::thread::spawn(move || {
+            with_live_files_transaction(&first_home, || {
+                with_live_files_transaction(&first_home, || Ok(()))?;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+        let external_process_contender =
+            open_live_files_lock(&home.join(LIVE_FILES_TRANSACTION_LOCK)).unwrap();
+        assert!(FileExt::try_lock_exclusive(&external_process_contender).is_err());
+
+        let (second_tx, second_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            with_live_files_transaction(&home, || {
+                second_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+        assert!(matches!(
+            second_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        second.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn config_failure_rollback_reports_every_failed_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let auth_path = temp.path().join("auth.json");
+        std::fs::create_dir(&config_path).unwrap();
+        std::fs::create_dir(&auth_path).unwrap();
+
+        let error = restore_live_files_after_config_failure(
+            &config_path,
+            Some(b"old config"),
+            &auth_path,
+            Some(b"old auth"),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("auth.json="));
+        assert!(error.contains("config.toml="));
+        assert!(!error.contains("auth.json=ok"));
+        assert!(!error.contains("config.toml=ok"));
+    }
 
     #[test]
     fn merge_common_config_preserves_explicit_profile_goals_override() {

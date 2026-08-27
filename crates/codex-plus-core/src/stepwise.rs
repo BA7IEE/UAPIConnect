@@ -713,7 +713,6 @@ fn normalize_spaces(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

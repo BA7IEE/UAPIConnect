@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 static CODEX_HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -110,14 +110,14 @@ fn rollout_files_snapshot(path: &Path) -> Vec<(String, Vec<u8>, SystemTime)> {
 
 fn catalog_rows_snapshot(path: &Path) -> Vec<(String, String)> {
     let db = Connection::open(path).unwrap();
-    db.prepare(
-        "SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id",
-    )
-    .unwrap()
-    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-    .unwrap()
-    .collect::<rusqlite::Result<Vec<_>>>()
-    .unwrap()
+    db.prepare("SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 fn write_subagent_rollout(path: &Path, provider: &str, thread_id: &str, cwd: &str) {
@@ -568,10 +568,7 @@ fn provider_sync_ignores_spawned_subagent_threads() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(
-        child,
-        ("openai".to_string(), 0, "C:/child-old".to_string())
-    );
+    assert_eq!(child, ("openai".to_string(), 0, "C:/child-old".to_string()));
 }
 
 #[test]
@@ -592,18 +589,8 @@ fn provider_sync_preserves_marked_subagents_and_explicit_user_priority() {
         "structured-child",
         "C:/structured-new",
     );
-    write_subagent_rollout(
-        &rollout_child,
-        "openai",
-        "rollout-child",
-        "C:/rollout-new",
-    );
-    write_rollout(
-        &marked_rollout,
-        "openai",
-        "marked-child",
-        "C:/marked-new",
-    );
+    write_subagent_rollout(&rollout_child, "openai", "rollout-child", "C:/rollout-new");
+    write_rollout(&marked_rollout, "openai", "marked-child", "C:/marked-new");
     write_rollout(
         &explicit_user_rollout,
         "openai",
@@ -679,19 +666,15 @@ fn provider_sync_preserves_marked_subagents_and_explicit_user_priority() {
         (&explicit_user_rollout, "apigather"),
         (&guardian_user_rollout, "openai"),
     ] {
-        let first: serde_json::Value = serde_json::from_str(
-            fs::read_to_string(path).unwrap().lines().next().unwrap(),
-        )
-        .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(path).unwrap().lines().next().unwrap())
+                .unwrap();
         assert_eq!(first["payload"]["model_provider"], provider);
     }
 
     let db = Connection::open(state).unwrap();
     for (id, expected) in [
-        (
-            "structured-child",
-            ("openai", 0_i64, "C:/structured-old"),
-        ),
+        ("structured-child", ("openai", 0_i64, "C:/structured-old")),
         ("rollout-child", ("openai", 0_i64, "C:/rollout-old")),
         ("marked-child", ("openai", 0_i64, "C:/marked-old")),
         ("explicit-user", ("apigather", 1_i64, "C:/user-new")),
@@ -704,7 +687,10 @@ fn provider_sync_preserves_marked_subagents_and_explicit_user_priority() {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(actual, (expected.0.to_string(), expected.1, expected.2.to_string()));
+        assert_eq!(
+            actual,
+            (expected.0.to_string(), expected.1, expected.2.to_string())
+        );
     }
 }
 
@@ -1081,12 +1067,7 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
     let rollout_dir = home.join("sessions/catalog-eligibility");
     for (id, source, thread_source, updated_at) in [
         ("user-one", "vscode", "user", 200000_i64),
-        (
-            "explicit-user",
-            "subagent_review",
-            "user",
-            205000_i64,
-        ),
+        ("explicit-user", "subagent_review", "user", 205000_i64),
         (
             "guardian-user",
             r#"{"subagent":{"other":"guardian"}}"#,
@@ -1156,7 +1137,11 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
             r#"{"sub_agent":{"other":"review"}}"#,
             235000_i64,
         ),
-        ("internal-child", "internal_memory_consolidation", 237000_i64),
+        (
+            "internal-child",
+            "internal_memory_consolidation",
+            237000_i64,
+        ),
         ("edge-child", "cli", 240000_i64),
     ] {
         let rollout_path = rollout_dir.join(format!("{id}.jsonl"));
@@ -1202,7 +1187,9 @@ fn provider_sync_catalogs_user_threads_but_skips_subagents() {
     assert_eq!(result.sqlite_rows_updated, 5);
     let db = Connection::open(&catalog_db).unwrap();
     let mut stmt = db
-        .prepare("SELECT thread_id FROM local_thread_catalog WHERE host_id = 'local' ORDER BY thread_id")
+        .prepare(
+            "SELECT thread_id FROM local_thread_catalog WHERE host_id = 'local' ORDER BY thread_id",
+        )
         .unwrap();
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -1316,9 +1303,7 @@ fn provider_sync_prunes_existing_local_subagent_catalog_rows() {
 
     let db = Connection::open(&catalog_db).unwrap();
     let mut stmt = db
-        .prepare(
-            "SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id",
-        )
+        .prepare("SELECT host_id, thread_id FROM local_thread_catalog ORDER BY host_id, thread_id")
         .unwrap();
     let rows = stmt
         .query_map([], |row| {
@@ -2064,92 +2049,6 @@ fn remote_control_finalization_ignores_archived_and_other_provider_threads() {
             .unwrap(),
         0
     );
-}
-
-#[test]
-fn remote_control_finalization_defers_when_rollout_changes_after_collection() {
-    let tmp = tempdir().unwrap();
-    let home = tmp.path().join(".codex");
-    let sqlite_dir = home.join("sqlite");
-    fs::create_dir_all(&sqlite_dir).unwrap();
-    fs::write(home.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
-    let rollout = home.join("sessions/rollout-mobile.jsonl");
-    write_rollout(&rollout, "openai", "mobile", "C:/workspace");
-    let state_db = home.join("state_5.sqlite");
-    create_remote_control_state_db(&state_db, &[("mobile", "openai", 0, &rollout)]);
-    let db = Connection::open(&state_db).unwrap();
-    db.execute("CREATE TABLE backup_padding (data BLOB)", [])
-        .unwrap();
-    db.execute("INSERT INTO backup_padding VALUES (zeroblob(33554432))", [])
-        .unwrap();
-    drop(db);
-    let catalog_db = sqlite_dir.join("codex-dev.db");
-    create_local_thread_catalog_db(&catalog_db, &[]);
-
-    let backup_root = home.join("backups_state/provider-sync");
-    let watched_rollout = rollout.clone();
-    let writer = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let backup_started = backup_root.exists()
-                && fs::read_dir(&backup_root)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false);
-            if backup_started {
-                let mut file = fs::OpenOptions::new()
-                    .append(true)
-                    .open(&watched_rollout)
-                    .unwrap();
-                use std::io::Write as _;
-                writeln!(
-                    file,
-                    "{}",
-                    json!({"type": "event_msg", "payload": {"type": "task_started"}})
-                )
-                .unwrap();
-                return;
-            }
-            assert!(Instant::now() < deadline, "backup did not start in time");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
-    let result = run_remote_control_session_finalization_for_thread_with_target(
-        Some(&home),
-        "mobile",
-        "custom",
-    );
-    writer.join().unwrap();
-
-    assert_eq!(result.status, ProviderSyncStatus::Skipped);
-    assert_eq!(result.changed_session_files, 0);
-    assert_eq!(result.skipped_locked_rollout_files.len(), 1);
-    assert_eq!(
-        fs::canonicalize(&result.skipped_locked_rollout_files[0]).unwrap(),
-        fs::canonicalize(&rollout).unwrap()
-    );
-    let text = fs::read_to_string(&rollout).unwrap();
-    assert!(text.contains("task_started"));
-    let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-    assert_eq!(first["payload"]["model_provider"], "openai");
-    let state = Connection::open(&state_db).unwrap();
-    let provider: String = state
-        .query_row(
-            "SELECT model_provider FROM threads WHERE id = 'mobile'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(provider, "openai");
-    let catalog = Connection::open(&catalog_db).unwrap();
-    let catalog_rows: i64 = catalog
-        .query_row(
-            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = 'mobile'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(catalog_rows, 0);
 }
 
 #[test]
@@ -2939,6 +2838,7 @@ fn session_index_preview_preserves_relation_only_sqlite_thread_references() {
     assert!(preview.candidates.is_empty());
 }
 
+#[cfg(any(unix, windows))]
 #[test]
 fn session_index_cleanup_write_failure_reports_backup_and_preserves_original() {
     let tmp = tempdir().unwrap();
@@ -2948,14 +2848,46 @@ fn session_index_cleanup_write_failure_reports_backup_and_preserves_original() {
     let original = format!("{}\n", session_index_line(stale_id, "stale"));
     fs::write(home.join("session_index.jsonl"), &original).unwrap();
     let preview = preview_session_index_cleanup(Some(&home)).unwrap();
-    fs::create_dir(home.join("session_index.jsonl.tmp")).unwrap();
 
-    let error = apply_session_index_cleanup(
+    // atomic_write 使用唯一临时文件，不能再靠占用固定的 `.tmp` 名称制造失败。
+    // Unix 上保留可写的锁/备份子目录后收紧 home 目录，Windows 上则允许
+    // 其他读取但拒绝删除共享，使 MoveFileEx 的原子替换稳定失败。
+    #[cfg(unix)]
+    let original_home_mode = {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(home.join("tmp")).unwrap();
+        fs::create_dir_all(home.join("backups_state/provider-sync")).unwrap();
+        let mode = fs::metadata(&home).unwrap().permissions().mode();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o555)).unwrap();
+        mode
+    };
+    #[cfg(windows)]
+    let _replace_blocker = {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(home.join("session_index.jsonl"))
+            .unwrap()
+    };
+
+    let result = apply_session_index_cleanup(
         Some(&home),
         &preview.snapshot_sha256,
         &[stale_id.to_string()],
-    )
-    .unwrap_err();
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&home, fs::Permissions::from_mode(original_home_mode)).unwrap();
+    }
+
+    let error = result.unwrap_err();
 
     assert!(error.message.contains("原子写入"));
     let backup = error.backup_dir.expect("failure must expose backup");

@@ -4,9 +4,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
-pub const DEFAULT_LATEST_JSON_URL: &str =
-    "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
+pub const DEFAULT_REPOSITORY: &str = crate::distribution::UPDATE_REPOSITORY;
+pub const DEFAULT_LATEST_JSON_URL: &str = crate::distribution::UPDATE_FEED_URL;
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -183,6 +182,16 @@ pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Relea
 }
 
 pub async fn check_for_update(current_version: &str) -> anyhow::Result<UpdateCheck> {
+    if !crate::distribution::UPDATES_ENABLED {
+        return Ok(UpdateCheck {
+            current_version: current_version.to_string(),
+            latest_version: None,
+            release_summary: "测试版暂未启用自动更新。".to_string(),
+            asset_name: None,
+            asset_url: None,
+            update_available: false,
+        });
+    }
     let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
     let update_available = is_newer_version(&release.version, current_version)?;
     Ok(UpdateCheck {
@@ -199,6 +208,9 @@ pub async fn perform_update(
     release: &Release,
     download_dir: &Path,
 ) -> anyhow::Result<UpdateInstall> {
+    if !crate::distribution::UPDATES_ENABLED {
+        anyhow::bail!("测试版暂未启用自动更新");
+    }
     let url = release
         .asset_url
         .as_ref()

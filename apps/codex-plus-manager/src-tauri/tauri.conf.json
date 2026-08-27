@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex++ Manager",
+  "productName": "U-API Connect",
   "version": "1.2.55",
-  "identifier": "com.bigpizzav3.codexplusplus.manager",
+  "identifier": "cn.u-studio.uapi.connect.manager",
   "build": {
     "beforeDevCommand": "npm run vite:dev",
     "beforeBuildCommand": "npm run vite:build",
@@ -14,7 +14,7 @@
       {
         "create": false,
         "label": "main",
-        "title": "Codex++ 管理工具",
+        "title": "U-API Connect",
         "width": 1180,
         "height": 820,
         "minWidth": 960,

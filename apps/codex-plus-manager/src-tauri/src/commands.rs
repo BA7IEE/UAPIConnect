@@ -723,7 +723,8 @@ where
     F: FnOnce(&LaunchRequest) -> anyhow::Result<()>,
 {
     let snapshot = if let Some(settings) = settings {
-        let snapshot = RelayLiveSnapshot::capture(home)?;
+        let target_profile = settings.active_relay_profile();
+        let snapshot = RelayLiveSnapshot::capture(home, &target_profile.id)?;
         if let Err(error) = sync_active_relay_to_home(settings, home) {
             if let Err(restore_error) = snapshot.restore(home) {
                 anyhow::bail!("同步当前供应商失败：{error}；回滚 live 配置也失败：{restore_error}");
@@ -750,13 +751,20 @@ where
 struct RelayLiveSnapshot {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
+    managed_catalog_path: std::path::PathBuf,
+    managed_catalog: Option<Vec<u8>>,
 }
 
 impl RelayLiveSnapshot {
-    fn capture(home: &Path) -> anyhow::Result<Self> {
+    fn capture(home: &Path, target_profile_id: &str) -> anyhow::Result<Self> {
+        let managed_catalog_path = home.join(
+            codex_plus_core::relay_config::managed_model_catalog_relative_path(target_profile_id),
+        );
         Ok(Self {
             config: read_optional_file_bytes(&home.join("config.toml"))?,
             auth: read_optional_file_bytes(&home.join("auth.json"))?,
+            managed_catalog: read_optional_file_bytes(&managed_catalog_path)?,
+            managed_catalog_path,
         })
     }
 
@@ -764,6 +772,7 @@ impl RelayLiveSnapshot {
         std::fs::create_dir_all(home)?;
         restore_optional_file_bytes(&home.join("config.toml"), self.config.as_deref())?;
         restore_optional_file_bytes(&home.join("auth.json"), self.auth.as_deref())?;
+        restore_optional_file_bytes(&self.managed_catalog_path, self.managed_catalog.as_deref())?;
         Ok(())
     }
 }
@@ -6696,11 +6705,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("config.toml"), "model = \"old\"\n").unwrap();
         std::fs::write(temp.path().join("auth.json"), "{\"old\":true}\n").unwrap();
+        std::fs::create_dir_all(temp.path().join("model-catalogs")).unwrap();
+        let catalog_path = temp.path().join("model-catalogs").join("source.json");
+        let original_catalog = "{\"models\":[{\"slug\":\"old\"}]}\n";
+        std::fs::write(&catalog_path, original_catalog).unwrap();
+        let mut settings = routed_pure_api_settings();
+        settings.relay_profiles[0].model = "custom-model".to_string();
+        settings.relay_profiles[0].model_list = "custom-model".to_string();
+        settings.relay_profiles[0].model_windows = r#"{"custom-model":"1M"}"#.to_string();
 
         let result = restart_codex_plus_after_stop(
             &launch_request(true),
             temp.path(),
-            Some(&routed_pure_api_settings()),
+            Some(&settings),
             |_| anyhow::bail!("synthetic spawn failure"),
         );
 
@@ -6712,6 +6729,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(temp.path().join("auth.json")).unwrap(),
             "{\"old\":true}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(catalog_path).unwrap(),
+            original_catalog
         );
     }
 
@@ -7132,7 +7153,6 @@ enabled = true
         );
     }
 
-    #[test]
     /// #1972：用户误把 Codex++ 自己的 exe 选成了「Codex 应用路径」——文件选择器
     /// 只按 exe 扩展名过滤，拦不住。以前无效路径会原样存进 settings.json，而
     /// launcher 拿到显式无效 --app-path 又不回退自动探测，于是启动永久失败，

@@ -1,0 +1,226 @@
+/* U-API Connect distribution shell.
+   Keep all edition-specific styling in this isolated block so upstream App.tsx
+   and the shared design system remain easy to merge. */
+.uapi-screen {
+  overflow-y: auto;
+}
+
+.uapi-stack {
+  display: grid;
+  gap: 14px;
+  max-width: 1040px;
+  margin: 0 auto;
+}
+
+.uapi-nav-copy {
+  display: grid;
+  min-width: 0;
+  text-align: left;
+}
+
+.uapi-nav-copy strong {
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.uapi-nav-copy small {
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+  margin-top: 1px;
+}
+
+.uapi-hero-content {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  padding: 20px;
+}
+
+.uapi-hero-icon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 10px;
+  background: hsl(var(--brand-accent) / 0.16);
+  color: hsl(var(--brand-accent));
+}
+
+.uapi-hero-copy h2,
+.uapi-about-hero h2 {
+  margin: 4px 0 6px;
+  font-size: 20px;
+}
+
+.uapi-hero-copy p,
+.uapi-about-hero p {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  line-height: 1.6;
+}
+
+.uapi-health-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.uapi-badge {
+  justify-self: end;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.uapi-badge.ok {
+  background: hsl(var(--status-success) / 0.14);
+  color: hsl(var(--status-success));
+}
+
+.uapi-badge.warning {
+  background: hsl(var(--status-warning) / 0.14);
+  color: hsl(var(--status-warning));
+}
+
+.uapi-form {
+  display: grid;
+  gap: 16px;
+}
+
+.uapi-locked-service {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid hsl(var(--brand-accent) / 0.28);
+  border-radius: 8px;
+  background: hsl(var(--brand-accent) / 0.08);
+  padding: 12px;
+  color: hsl(var(--brand-accent));
+}
+
+.uapi-locked-service > div {
+  display: grid;
+  gap: 2px;
+}
+
+.uapi-locked-service span {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.uapi-key-field {
+  max-width: 720px;
+}
+
+.uapi-key-field small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.uapi-key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.uapi-model-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 14px;
+}
+
+.uapi-model-list code,
+.uapi-model-list span {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--surface-sunken));
+  padding: 5px 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.uapi-empty {
+  margin-top: 14px;
+  border: 1px dashed hsl(var(--border));
+  border-radius: 8px;
+  padding: 18px;
+  color: hsl(var(--muted-foreground));
+  text-align: center;
+}
+
+.uapi-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 1040px;
+  margin: 0 auto;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.uapi-notice.ok {
+  border-color: hsl(var(--status-success) / 0.35);
+  background: hsl(var(--status-success) / 0.08);
+  color: hsl(var(--status-success));
+}
+
+.uapi-notice.error {
+  border-color: hsl(var(--status-error) / 0.35);
+  background: hsl(var(--status-error) / 0.08);
+  color: hsl(var(--status-error));
+}
+
+.uapi-notice.info {
+  border-color: hsl(var(--brand-accent) / 0.35);
+  background: hsl(var(--brand-accent) / 0.08);
+  color: hsl(var(--brand-accent));
+}
+
+.uapi-about-hero {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 22px;
+}
+
+.uapi-about-mark {
+  flex: 0 0 auto;
+}
+
+.uapi-version {
+  margin-left: auto;
+  border-radius: 999px;
+  background: hsl(var(--secondary));
+  padding: 5px 9px;
+  color: hsl(var(--muted-foreground));
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+}
+
+@media (max-width: 1080px) {
+  .uapi-shell .brand-copy,
+  .uapi-shell .uapi-nav-copy {
+    display: none;
+  }
+
+  .uapi-shell .brand-title::after {
+    content: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .uapi-hero-content {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .uapi-hero-actions {
+    grid-column: 1 / -1;
+  }
+
+  .uapi-health-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -13,6 +13,7 @@ base64.workspace = true
 directories.workspace = true
 futures-util = "0.3"
 fs2.workspace = true
+keyring.workspace = true
 reqwest.workspace = true
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rusqlite.workspace = true
