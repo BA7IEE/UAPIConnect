@@ -3,6 +3,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -1673,6 +1675,14 @@ fn atomic_write_with_privacy(path: &Path, bytes: &[u8], private: bool) -> anyhow
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
+    // Windows 不允许多个发布者同时覆盖同一路径，先消除本进程内的竞争。
+    #[cfg(windows)]
+    let process_lock = atomic_write_process_lock(path);
+    #[cfg(windows)]
+    let _process_guard = process_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let temp_path = write_atomic_temp(path, bytes, private)?;
     if let Err(error) = replace_file(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
@@ -1685,6 +1695,22 @@ fn atomic_write_with_privacy(path: &Path, bytes: &[u8], private: bool) -> anyhow
         });
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_write_process_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
 }
 
 fn write_atomic_temp(
@@ -1753,6 +1779,9 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, WIN32_ERROR,
+    };
     use windows::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
@@ -1768,14 +1797,32 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
+    for attempt in 0..12 {
+        let result = unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < 11
+                    && WIN32_ERROR::from_error(&error).is_some_and(|code| {
+                        matches!(
+                            code,
+                            ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION
+                        )
+                    }) =>
+            {
+                let delay_ms = 1_u64 << attempt.min(4);
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(())
+    unreachable!("Windows replace retry loop always returns")
 }
 
 #[cfg(test)]
