@@ -81,7 +81,11 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: |
-          $version = "1.2.49-uapi.${{ github.run_number }}"
+          $versionMatch = Select-String -Path "Cargo.toml" -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1
+          if (-not $versionMatch) { throw "Cannot read workspace version from Cargo.toml" }
+          $baseVersion = $versionMatch.Matches[0].Groups[1].Value
+          $version = "$baseVersion-uapi.${{ github.run_number }}"
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) { $makensis = "makensis" }
           Push-Location scripts/uapi/installer/windows
@@ -277,7 +281,10 @@ jobs:
       - name: Package DMG
         env:
           BINARY_DIR: ${{ github.workspace }}/target/${{ matrix.target }}/release
-        run: bash scripts/uapi/package-macos-dmg.sh "1.2.49-uapi.${GITHUB_RUN_NUMBER}" "${{ matrix.arch }}"
+        run: |
+          base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$base_version"
+          bash scripts/uapi/package-macos-dmg.sh "${base_version}-uapi.${GITHUB_RUN_NUMBER}" "${{ matrix.arch }}"
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
         with:

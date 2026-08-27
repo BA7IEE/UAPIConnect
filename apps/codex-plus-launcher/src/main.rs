@@ -39,6 +39,20 @@ fn fixed_provider_launch_preparation(status: &UapiStatus) -> FixedProviderLaunch
     }
 }
 
+async fn bounded_model_refresh<T>(
+    timeout: std::time::Duration,
+    refresh: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Option<String> {
+    match tokio::time::timeout(timeout, refresh).await {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some(format!(
+            "启动前刷新模型超过 {} 秒，继续使用上次配置",
+            timeout.as_secs()
+        )),
+    }
+}
+
 impl Default for LauncherHooks {
     fn default() -> Self {
         Self {
@@ -100,14 +114,15 @@ async fn launcher_main(helper_only: bool, options: LaunchOptions) -> Result<()> 
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
-    if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+    let fixed_provider_preparation = if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
         if let Err(error) = codex_plus_core::uapi::enforce_distribution_defaults() {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                 "uapi.distribution_defaults_failed_nonfatal",
                 json!({ "message": error.to_string() }),
             );
         }
-        match fixed_provider_launch_preparation(&codex_plus_core::uapi::status()) {
+        let preparation = fixed_provider_launch_preparation(&codex_plus_core::uapi::status());
+        match preparation {
             FixedProviderLaunchPreparation::OpenConnectionSettings => {
                 codex_plus_core::install::spawn_companion(
                     codex_plus_core::install::MANAGER_BINARY,
@@ -116,17 +131,13 @@ async fn launcher_main(helper_only: bool, options: LaunchOptions) -> Result<()> 
                 .map_err(|error| anyhow::anyhow!("启动连接设置失败：{error}"))?;
                 return Ok(());
             }
-            FixedProviderLaunchPreparation::RefreshModels => {
-                if let Err(error) = codex_plus_core::uapi::refresh_models().await {
-                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                        "uapi.models_refresh_failed_nonfatal",
-                        json!({ "message": error.to_string() }),
-                    );
-                }
-            }
+            FixedProviderLaunchPreparation::RefreshModels => {}
             FixedProviderLaunchPreparation::Continue => {}
         }
-    }
+        preparation
+    } else {
+        FixedProviderLaunchPreparation::Continue
+    };
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
@@ -141,6 +152,19 @@ async fn launcher_main(helper_only: bool, options: LaunchOptions) -> Result<()> 
         })?;
         return Ok(());
     };
+    if fixed_provider_preparation == FixedProviderLaunchPreparation::RefreshModels {
+        let refresh_error = bounded_model_refresh(
+            std::time::Duration::from_secs(10),
+            codex_plus_core::uapi::refresh_models(),
+        )
+        .await;
+        if let Some(message) = refresh_error {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "uapi.models_refresh_failed_nonfatal",
+                json!({ "message": message }),
+            );
+        }
+    }
     if codex_plus_core::distribution::UPDATES_ENABLED {
         tokio::spawn(async {
             let _ = notify_manager_when_update_available().await;
@@ -1208,6 +1232,32 @@ mod tests {
         assert_eq!(
             fixed_provider_launch_preparation(&live_uapi),
             FixedProviderLaunchPreparation::RefreshModels
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_model_refresh_is_bounded_and_nonfatal() {
+        let success = bounded_model_refresh(std::time::Duration::from_secs(1), async {
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        assert_eq!(success, None);
+
+        let failure = bounded_model_refresh(std::time::Duration::from_secs(1), async {
+            Err::<(), _>(anyhow::anyhow!("synthetic refresh failure"))
+        })
+        .await;
+        assert_eq!(failure.as_deref(), Some("synthetic refresh failure"));
+
+        let timeout = bounded_model_refresh(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await;
+        assert!(
+            timeout
+                .as_deref()
+                .is_some_and(|message| message.contains("上次配置"))
         );
     }
 

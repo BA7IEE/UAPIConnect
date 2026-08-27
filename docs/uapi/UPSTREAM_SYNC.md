@@ -7,12 +7,30 @@ git remote add upstream https://github.com/BigPizzaV3/CodexPlusPlus.git
 git remote add origin <your fork>
 ```
 
+## 同步原则
+
+默认只同步已经发布的稳定 tag，不直接追逐 `upstream/main`。先查看主线新增提交和
+最新 release，再决定目标版本。这样 Windows、macOS 安装测试都有一个可复现的
+上游基线；确实需要未发布修复时，单独记录目标 commit 和原因。
+
+当前历史已经和上游连通，禁止再使用 `--allow-unrelated-histories`，也不要把旧版
+大提交整体重放到新版源码上。
+
 ## Sync procedure
 
 ```bash
 git fetch upstream --tags
-git switch -c upstream-sync/<date> main
-git merge --no-ff upstream/main
+git switch main
+git pull --ff-only origin main
+git switch -c codex/upstream-v<version>
+git merge --no-ff v<version>
+```
+
+合并前先确认目标 tag 确实位于上游历史，并记录比较范围：
+
+```bash
+git merge-base --is-ancestor v<current> v<version>
+git log --oneline v<current>..v<version>
 ```
 
 Resolve conflicts by priority:
@@ -24,6 +42,7 @@ Resolve conflicts by priority:
    where the same catalog transaction must work for every profile. Shared
    styles are reused read-only; edition CSS lives in `src/uapi/uapi.css`.
 4. Run the full U-API workflow before merging.
+5. 不直接覆盖整个共享文件，不通过删除测试来解决冲突。
 
 ## Expected integration surface
 

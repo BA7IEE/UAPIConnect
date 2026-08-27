@@ -39,10 +39,10 @@ $env:UAPI_CONNECT_DISTRIBUTION = "1"
 cargo build --release
 ```
 
-这个标记会为 U-API 版嵌入 `asInvoker` 清单，使程序、用户配置、Credential
-Manager 和 Store 版 Codex 保持在同一个交互用户下。通用 Codex++ 构建未设置该
-标记时仍保留管理员清单。Windows 安装包还需要 NSIS 3；官方工作流会自动设置
-标记并生成 `UAPIConnect-<版本>-windows-x64-setup.exe`。
+这个标记会选择 U-API 专用应用清单。U-API 与当前上游 Codex++ 都使用
+`asInvoker`，让程序、用户配置、Credential Manager 和 Store 版 Codex 保持在
+同一个交互用户下。Windows 安装包还需要 NSIS 3；官方工作流会自动设置标记并
+生成 `UAPIConnect-<版本>-windows-x64-setup.exe`。
 
 ## macOS 安装
 
@@ -125,11 +125,11 @@ https://token.u-studio.cn/v1
 
 ## 上游同步
 
-仓库包含两个提交：
+当前主线建立在上游稳定发行版上：
 
 ```text
-722d6f2  baseline: CodexPlusPlus 1.2.49
-后续提交  U-API Connect 定制
+v1.2.55  CodexPlusPlus 上游发行基线
+后续提交  U-API Connect 定制与同步修复
 ```
 
 完整同步流程见：

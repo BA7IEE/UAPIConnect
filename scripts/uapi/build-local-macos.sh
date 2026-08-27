@@ -112,7 +112,9 @@ case "$(uname -m)" in
   x86_64) ARCH="x64" ;;
   *) fail "不支持的芯片架构：$(uname -m)" ;;
 esac
-VERSION="1.2.49-uapi.local.$STAMP"
+BASE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)"
+[ -n "$BASE_VERSION" ] || fail "无法从 Cargo.toml 读取版本。"
+VERSION="${BASE_VERSION}-uapi.local.$STAMP"
 BINARY_DIR="$ROOT/target/release" bash "$ROOT/scripts/uapi/package-macos-dmg.sh" "$VERSION" "$ARCH"
 DMG="$ROOT/dist/uapi/macos/UAPIConnect-${VERSION}-macos-${ARCH}.dmg"
 test -f "$DMG" || fail "DMG 未生成。"

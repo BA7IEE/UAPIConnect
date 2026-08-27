@@ -390,6 +390,7 @@ pub async fn discover_models(api_key: &str) -> anyhow::Result<UapiModelDiscovery
     let client = crate::http_client::proxied_client(distribution::PRODUCT_NAME)?;
     let response = client
         .get(&endpoint)
+        .timeout(std::time::Duration::from_secs(30))
         .bearer_auth(&api_key)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()

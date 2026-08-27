@@ -9,13 +9,22 @@ cd "$ROOT"
 # provider-sync source entry is the private deterministic seam for its TOCTOU
 # regression test; the protocol-proxy test only replaces a flaky wall-clock
 # assertion. The model editor paths are the audited per-model catalog points.
-allowed='^(Cargo\.(toml|lock)|distribution/.*|docs/uapi/.*|scripts/uapi/.*|\.github/workflows/uapi-build\.yml|crates/codex-plus-core/Cargo\.toml|crates/codex-plus-core/src/(distribution|uapi)\.rs|crates/codex-plus-core/src/uapi/.*|crates/codex-plus-core/src/lib\.rs|crates/codex-plus-core/src/(ads|update|launcher|model_suffix|relay_config|relay_switch|routes|settings)\.rs|crates/codex-plus-core/src/install/.*|crates/codex-plus-core/tests/(bridge_routes|dream_skin_runtime|installers|launcher|model_suffix|protocol_proxy|relay_config|relay_switch)\.rs|crates/codex-plus-data/src/provider_sync\.rs|crates/codex-plus-data/tests/(provider_sync|storage_adapter)\.rs|apps/codex-plus-launcher/(build\.rs|src/main\.rs)|apps/codex-plus-manager/(index\.html|src/uapi/.*|src/uapi-launch-policy(\.test)?\.ts|src/model-(routes\.test|windows(\.test)?)\.ts|src/App\.tsx|src/main\.tsx|src/styles\.css)|apps/codex-plus-manager/src-tauri/(build\.rs|tauri\.conf\.json|tests/windows_subsystem\.rs|src/(commands|lib|main|uapi_commands)\.rs))$'
+allowed='^(Cargo\.(toml|lock)|distribution/.*|docs/uapi/.*|scripts/uapi/.*|\.github/workflows/uapi-build\.yml|crates/codex-plus-core/Cargo\.toml|crates/codex-plus-core/src/(distribution|uapi)\.rs|crates/codex-plus-core/src/uapi/.*|crates/codex-plus-core/src/lib\.rs|crates/codex-plus-core/src/(ads|update|launcher|model_suffix|relay_config|relay_switch|routes|session_share|settings|stepwise)\.rs|crates/codex-plus-core/src/install/.*|crates/codex-plus-core/tests/(bridge_routes|dream_skin_runtime|installers|launcher|model_suffix|protocol_proxy|relay_config|relay_switch)\.rs|crates/codex-plus-data/src/(provider_sync|storage)\.rs|crates/codex-plus-data/tests/(provider_sync|storage_adapter)\.rs|apps/codex-plus-launcher/(build\.rs|src/main\.rs)|apps/codex-plus-manager/(index\.html|src/uapi/.*|src/uapi-launch-policy(\.test)?\.ts|src/model-(routes\.test|windows(\.test)?)\.ts|src/App\.tsx|src/main\.tsx|src/styles\.css)|apps/codex-plus-manager/src-tauri/(build\.rs|tauri\.conf\.json|tests/windows_subsystem\.rs|src/(commands|lib|main|uapi_commands)\.rs))$'
 
 unexpected=0
 base_ref="${1:-}"
 if [ -z "$base_ref" ]; then
-  base_ref="$(git rev-list --max-parents=0 HEAD | tail -n 1)"
+  base_ref="$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)"
 fi
+if [ -z "$base_ref" ]; then
+  echo "cannot determine upstream release base; pass a release tag or commit explicitly" >&2
+  exit 1
+fi
+git merge-base --is-ancestor "$base_ref" HEAD || {
+  echo "upstream base is not an ancestor of HEAD: $base_ref" >&2
+  exit 1
+}
+echo "auditing customization surface against $base_ref"
 while IFS= read -r file; do
   [ -z "$file" ] && continue
   if ! printf '%s\n' "$file" | grep -Eq "$allowed"; then
