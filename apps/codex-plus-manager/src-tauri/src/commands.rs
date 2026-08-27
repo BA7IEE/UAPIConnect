@@ -687,8 +687,26 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
     }
     // 先确认状态文件可写，再停止当前进程。否则磁盘或权限错误会让命令
     // 返回“未执行重启”，实际却已经把正在使用的 Codex 关闭。
-    codex_plus_core::watcher::stop_launcher_processes_and_wait();
-    codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
+    if let Err(error) = stop_processes_before_restart(
+        codex_plus_core::watcher::stop_launcher_processes_and_wait,
+        || {
+            codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(
+                request.debug_port,
+            )
+        },
+    ) {
+        let message = format!("重启已中止，未停止 Codex：{error}");
+        let _ = save_requested_launch_status(&request, "failed", &message, launch_started_at_ms);
+        return failed(
+            &message,
+            json!({
+                "debugPort": request.debug_port,
+                "helperPort": request.helper_port,
+                "syncActiveRelay": request.sync_active_relay,
+                "launchStartedAtMs": launch_started_at_ms
+            }),
+        );
+    }
     match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), spawn_silent_launcher) {
         Ok(()) => CommandResult {
             status: "accepted".to_string(),
@@ -715,6 +733,17 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             )
         }
     }
+}
+
+fn stop_processes_before_restart<F, G>(stop_launcher: F, stop_codex: G) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+    G: FnOnce(),
+{
+    stop_launcher()
+        .map_err(|error| anyhow::anyhow!("无法安全确认或停止当前发行版 launcher：{error}"))?;
+    stop_codex();
+    Ok(())
 }
 
 fn restart_codex_plus_after_stop<F>(
@@ -6060,6 +6089,25 @@ mod tests {
 
         assert!(save_status < stop_launcher);
         assert!(save_status < stop_codex);
+    }
+
+    #[test]
+    fn restart_does_not_stop_codex_when_launcher_ownership_is_uncertain() {
+        let codex_stopped = std::cell::Cell::new(false);
+
+        let error = stop_processes_before_restart(
+            || anyhow::bail!("synthetic unresolved launcher path"),
+            || codex_stopped.set(true),
+        )
+        .unwrap_err();
+
+        assert!(!codex_stopped.get());
+        assert!(
+            error
+                .to_string()
+                .contains("无法安全确认或停止当前发行版 launcher")
+        );
+        assert!(error.to_string().contains("unresolved launcher path"));
     }
 
     #[test]

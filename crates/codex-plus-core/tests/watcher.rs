@@ -1,8 +1,8 @@
 use codex_plus_core::watcher::{
-    build_spawn_launcher_command, build_watcher_install_plan, cdp_listening, codex_process_ids,
-    disable_watcher_at, enable_watcher_at, filter_killable_launcher_processes,
+    LauncherProcessInfo, build_spawn_launcher_command, build_watcher_install_plan, cdp_listening,
+    codex_process_ids, disable_watcher_at, enable_watcher_at, filter_owned_launcher_processes,
     process_id_is_running, process_ids_still_running, should_recover_stale_launcher,
-    watcher_disabled_flag,
+    terminate_revalidated_launcher_processes, watcher_disabled_flag,
 };
 
 #[cfg(windows)]
@@ -115,16 +115,123 @@ fn codex_process_filter_keeps_chatgpt_desktop_package_processes() {
 }
 
 #[test]
-fn launcher_process_filter_protects_current_process_ancestry() {
-    let processes = [
-        (10, 0, "codex-plus-plus.exe"),
-        (20, 10, "codex-plus-plus.exe"),
-        (30, 20, "codex-plus-plus.exe"),
-        (40, 10, "codex-plus-plus.exe"),
-        (50, 10, "codex-plus-plus-manager.exe"),
+fn launcher_process_filter_requires_the_owned_path_and_protects_ancestry() {
+    let temp = tempfile::tempdir().unwrap();
+    let owned_dir = temp.path().join("owned");
+    let foreign_dir = temp.path().join("foreign");
+    std::fs::create_dir_all(&owned_dir).unwrap();
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    let launcher_name = "codex-plus-plus-test";
+    let owned_launcher = owned_dir.join(launcher_name);
+    let foreign_launcher = foreign_dir.join(launcher_name);
+    std::fs::write(&owned_launcher, b"owned").unwrap();
+    std::fs::write(&foreign_launcher, b"foreign").unwrap();
+    let process = |process_id, parent_process_id, executable_name: &str, executable_path| {
+        LauncherProcessInfo {
+            process_id,
+            parent_process_id,
+            executable_name: executable_name.to_string(),
+            executable_path,
+        }
+    };
+    let processes = vec![
+        process(10, 0, launcher_name, Some(owned_launcher.clone())),
+        process(20, 10, launcher_name, Some(owned_launcher.clone())),
+        process(30, 20, launcher_name, Some(owned_launcher.clone())),
+        process(40, 10, launcher_name, Some(owned_launcher.clone())),
+        process(50, 10, "codex-plus-plus-manager-test", None),
+        process(60, 10, launcher_name, Some(foreign_launcher)),
     ];
 
-    assert_eq!(filter_killable_launcher_processes(processes, 30), vec![40]);
+    assert_eq!(
+        filter_owned_launcher_processes(&processes, 30, &owned_launcher).unwrap(),
+        vec![40]
+    );
+}
+
+#[test]
+fn launcher_process_filter_fails_closed_for_an_unresolved_same_name_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let launcher = temp.path().join("codex-plus-plus-test");
+    std::fs::write(&launcher, b"owned").unwrap();
+    let processes = vec![LauncherProcessInfo {
+        process_id: 40,
+        parent_process_id: 10,
+        executable_name: "codex-plus-plus-test".to_string(),
+        executable_path: None,
+    }];
+
+    let error = filter_owned_launcher_processes(&processes, 30, &launcher).unwrap_err();
+
+    assert!(error.to_string().contains("无法确认同名启动器进程 40"));
+}
+
+#[test]
+fn launcher_process_filter_fails_closed_when_the_companion_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_launcher = temp.path().join("codex-plus-plus-test");
+
+    let error = filter_owned_launcher_processes(&[], 30, &missing_launcher).unwrap_err();
+
+    assert!(error.to_string().contains("无法确认启动器可执行文件"));
+}
+
+#[test]
+fn launcher_termination_rejects_a_reused_pid_before_calling_kill() {
+    let temp = tempfile::tempdir().unwrap();
+    let owned_dir = temp.path().join("owned");
+    let foreign_dir = temp.path().join("foreign");
+    std::fs::create_dir_all(&owned_dir).unwrap();
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    let launcher_name = "codex-plus-plus-test";
+    let owned_launcher = owned_dir.join(launcher_name);
+    let foreign_launcher = foreign_dir.join(launcher_name);
+    std::fs::write(&owned_launcher, b"owned").unwrap();
+    std::fs::write(&foreign_launcher, b"foreign").unwrap();
+    let terminated = std::cell::RefCell::new(Vec::new());
+
+    let error = terminate_revalidated_launcher_processes(
+        &[40],
+        &owned_launcher,
+        |_| {
+            Ok(Some(LauncherProcessInfo {
+                process_id: 40,
+                parent_process_id: 1,
+                executable_name: launcher_name.to_string(),
+                executable_path: Some(foreign_launcher.clone()),
+            }))
+        },
+        |process_id| {
+            terminated.borrow_mut().push(process_id);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+
+    assert!(terminated.borrow().is_empty());
+    assert!(error.to_string().contains("身份已变化"));
+    assert!(error.to_string().contains("已拒绝终止"));
+}
+
+#[test]
+fn launcher_termination_accepts_a_pid_that_already_exited() {
+    let temp = tempfile::tempdir().unwrap();
+    let launcher = temp.path().join("codex-plus-plus-test");
+    std::fs::write(&launcher, b"owned").unwrap();
+    let terminated = std::cell::Cell::new(false);
+
+    terminate_revalidated_launcher_processes(
+        &[40],
+        &launcher,
+        |_| Ok(None),
+        |_| {
+            terminated.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert!(!terminated.get());
 }
 
 #[test]

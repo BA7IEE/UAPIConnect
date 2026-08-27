@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 use codex_plus_core::install::macos::{install_app_bundles, repair_app_bundles};
-use codex_plus_core::install::windows::uapiconnect_url_protocol_command;
+use codex_plus_core::install::windows::{
+    uapiconnect_url_protocol_command, windows_uninstall_registration_values,
+};
 use codex_plus_core::install::{
     InstallOptions, MANAGER_BUNDLE_ID, SILENT_BINARY, SILENT_BUNDLE_ID, app_bundle_names,
     build_macos_app_bundle, build_windows_entrypoint_plan, companion_binary_path_from_exe,
@@ -111,22 +113,75 @@ fn windows_entrypoint_plan_contains_silent_and_manager_entrypoints() {
         "C:/Tools/codex-plus-plus-manager.exe"
     );
     assert_eq!(plan.uninstall_key, "UAPIConnect");
-    assert_eq!(plan.legacy_uninstall_key, "Codex++");
+    assert_eq!(plan.url_protocol_key, "uapiconnect");
     assert_eq!(
         plan.uninstaller_path.replace('\\', "/"),
         "C:/Tools/uninstall.exe"
     );
     assert_eq!(
+        plan.quiet_uninstall_bootstrapper_path.replace('\\', "/"),
+        "C:/Tools/quiet-uninstall-bootstrap.ps1"
+    );
+    assert_eq!(
         plan.uninstall_command.replace('\\', "/"),
         "\"C:/Tools/uninstall.exe\""
     );
-    assert_eq!(
-        plan.quiet_uninstall_command.replace('\\', "/"),
-        "\"C:/Tools/uninstall.exe\" /S"
+    let quiet_uninstall_command = plan.quiet_uninstall_command.replace('\\', "/");
+    assert!(
+        quiet_uninstall_command
+            .starts_with("\"C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe\"")
     );
+    assert!(quiet_uninstall_command.contains("-NoLogo -NoProfile -NonInteractive"));
+    assert!(quiet_uninstall_command.contains("-ExecutionPolicy Bypass -WindowStyle Hidden"));
+    assert!(
+        quiet_uninstall_command
+            .contains("-File \"C:/Tools/quiet-uninstall-bootstrap.ps1\" -InstallDir \"C:/Tools\"")
+    );
+    assert!(!quiet_uninstall_command.contains("uninstall.exe\" /S"));
     assert_ne!(
         plan.uninstall_command,
         "\"C:/Tools/codex-plus-plus-manager.exe\""
+    );
+}
+
+#[test]
+fn windows_entrypoint_maintenance_is_scoped_to_uapi_owned_registry_keys() {
+    let source = include_str!("../src/install/windows.rs");
+
+    assert!(!source.contains("LEGACY_UNINSTALL_SUBKEY"));
+    assert!(!source.contains("DREAM_SKIN_URL_PROTOCOL_SUBKEY"));
+    assert!(!source.contains(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex++"));
+    assert!(!source.contains(r"Software\Classes\dreamskin"));
+}
+
+#[test]
+fn windows_repair_only_registers_the_quiet_bootstrap_after_it_exists() {
+    let temp = tempfile::tempdir().unwrap();
+    let install_dir = temp.path().join("U-API Connect");
+    std::fs::create_dir(&install_dir).unwrap();
+    let options = InstallOptions {
+        install_root: Some(temp.path().join("Desktop")),
+        launcher_path: Some(install_dir.join("codex-plus-plus.exe")),
+        manager_path: Some(install_dir.join("codex-plus-plus-manager.exe")),
+        remove_owned_data: false,
+    };
+    let plan = build_windows_entrypoint_plan(&options);
+
+    let before = windows_uninstall_registration_values(&plan);
+    assert!(
+        !before
+            .iter()
+            .any(|(name, _)| *name == "QuietUninstallString")
+    );
+
+    std::fs::write(&plan.quiet_uninstall_bootstrapper_path, b"bootstrap").unwrap();
+    let after = windows_uninstall_registration_values(&plan);
+    assert_eq!(
+        after
+            .iter()
+            .find(|(name, _)| *name == "QuietUninstallString")
+            .map(|(_, value)| value),
+        Some(&plan.quiet_uninstall_command)
     );
 }
 

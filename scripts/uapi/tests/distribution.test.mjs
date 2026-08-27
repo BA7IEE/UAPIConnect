@@ -22,6 +22,18 @@ const windowsInstaller = readFileSync(
   new URL("../installer/windows/UAPIConnect.nsi", import.meta.url),
   "utf8",
 );
+const windowsProcessStopper = readFileSync(
+  new URL("../installer/windows/stop-owned-processes.ps1", import.meta.url),
+  "utf8",
+);
+const windowsQuietUninstallBootstrap = readFileSync(
+  new URL("../installer/windows/quiet-uninstall-bootstrap.ps1", import.meta.url),
+  "utf8",
+);
+const windowsInstallRepair = readFileSync(
+  new URL("../../../crates/codex-plus-core/src/install/windows.rs", import.meta.url),
+  "utf8",
+);
 const windowsLifecycle = readFileSync(
   new URL("./windows-installer-lifecycle.ps1", import.meta.url),
   "utf8",
@@ -99,9 +111,17 @@ test("Windows uninstall registration and cleanup are fail closed", () => {
     windowsInstaller.includes(String.raw`"UninstallString" '"$INSTDIR\uninstall.exe"'`),
     "UninstallString must quote the path because the install directory contains a space",
   );
-  assert.ok(
-    windowsInstaller.includes(String.raw`"QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'`),
-    "QuietUninstallString must preserve the quoted executable path",
+  assert.match(
+    windowsInstaller,
+    /"QuietUninstallString"[^\r\n]+WindowsPowerShell\\v1\.0\\powershell\.exe[^\r\n]+quiet-uninstall-bootstrap\.ps1[^\r\n]+-InstallDir "\$INSTDIR"/,
+  );
+  assert.doesNotMatch(
+    windowsInstaller,
+    /"QuietUninstallString"\s+'"\$INSTDIR\\uninstall\.exe" \/S'/,
+  );
+  assert.match(
+    windowsInstaller,
+    /File \/oname=quiet-uninstall-bootstrap\.ps1[^\r\n]+quiet-uninstall-bootstrap\.ps1/,
   );
   assert.match(windowsInstaller, /--uninstall-cleanup/);
   assert.match(windowsInstaller, /IfErrors cleanup_failed/);
@@ -113,7 +133,69 @@ test("Windows uninstall registration and cleanup are fail closed", () => {
   assert.ok(cleanup >= 0 && deleteManager > cleanup, "program files must survive until cleanup succeeds");
 });
 
-test("Windows CI executes the registered quiet uninstall command", () => {
+test("Windows installer stops only processes owned by its install directory", () => {
+  assert.doesNotMatch(windowsInstaller, /taskkill|\/IM\s+codex-plus-plus/i);
+  assert.equal(
+    (windowsInstaller.match(/File \/oname=stop-owned-processes\.ps1/g) ?? []).length,
+    2,
+    "installer and uninstaller must embed the same process ownership helper",
+  );
+  assert.equal(
+    (
+      windowsInstaller.match(
+        /-File "\$PLUGINSDIR\\stop-owned-processes\.ps1" -InstallDir "\$INSTDIR"/g,
+      ) ?? []
+    ).length,
+    2,
+    "installer and uninstaller must scope process stopping to their own install directory",
+  );
+  assert.match(windowsInstaller, /install_stop_failed:[\s\S]*?SetErrorLevel 2[\s\S]*?Abort/);
+  assert.match(windowsInstaller, /uninstall_stop_failed:[\s\S]*?SetErrorLevel 2[\s\S]*?Abort/);
+
+  const installStop = windowsInstaller.indexOf("-InstallDir");
+  const writeLauncher = windowsInstaller.indexOf(
+    'File "${ROOT}\\dist\\uapi\\windows\\app\\codex-plus-plus.exe"',
+  );
+  assert.ok(
+    installStop >= 0 && writeLauncher > installStop,
+    "owned processes must stop before install writes",
+  );
+
+  const uninstallSection = windowsInstaller.indexOf('Section "Uninstall"');
+  const uninstallStop = windowsInstaller.indexOf("-InstallDir", uninstallSection);
+  const cleanup = windowsInstaller.indexOf("--uninstall-cleanup", uninstallSection);
+  assert.ok(
+    uninstallStop > uninstallSection && cleanup > uninstallStop,
+    "owned processes must stop before uninstall cleanup",
+  );
+
+  assert.match(windowsProcessStopper, /"codex-plus-plus\.exe"/);
+  assert.match(windowsProcessStopper, /"codex-plus-plus-manager\.exe"/);
+  assert.match(windowsProcessStopper, /Win32_Process/);
+  assert.match(windowsProcessStopper, /ExecutablePath/);
+  assert.match(windowsProcessStopper, /return "Owned"/);
+  assert.match(windowsProcessStopper, /return "Foreign"/);
+  assert.match(windowsProcessStopper, /return "Unknown"/);
+  assert.match(
+    windowsProcessStopper,
+    /IsNullOrWhiteSpace\(\$executablePath\)[\s\S]*?return "Unknown"/,
+  );
+  assert.match(
+    windowsProcessStopper,
+    /default \{\s*throw "Cannot determine the executable path/,
+  );
+  assert.match(windowsProcessStopper, /Join-Path \$normalizedInstallDir \$processName/);
+  assert.match(windowsProcessStopper, /StringComparison\]::OrdinalIgnoreCase/);
+  assert.match(
+    windowsProcessStopper,
+    /\[string\]::Equals\(\$normalizedExecutablePath, \$ExpectedPaths\[\$name\], \$comparison\)/,
+  );
+  assert.match(windowsProcessStopper, /Stop-Process -Id \$processId -Force -ErrorAction Stop/);
+  assert.match(windowsProcessStopper, /ProcessId = \$processId/);
+  assert.match(windowsProcessStopper, /Get-OwnedProcesses[\s\S]*?remaining[\s\S]*?throw/);
+});
+
+test("Windows CI validates scoped processes and propagated quiet uninstall status", () => {
   assert.match(windowsLifecycle, /\$installers\.Count -ne 1/);
   assert.match(windowsLifecycle, /\.GetValue\("UninstallString"\)/);
   assert.match(windowsLifecycle, /\.GetValue\("QuietUninstallString"\)/);
@@ -121,6 +203,31 @@ test("Windows CI executes the registered quiet uninstall command", () => {
     windowsLifecycle,
     /Start-RegisteredCommand -CommandLine \$registeredCommands\.Quiet/,
   );
+  assert.match(windowsLifecycle, /uapi-foreign-same-name-\$PID/);
+  assert.match(windowsLifecycle, /System32\\PING\.EXE/);
+  assert.match(windowsLifecycle, /@\("codex-plus-plus\.exe", "codex-plus-plus-manager\.exe"\)/);
+  assert.match(windowsLifecycle, /\(\[string\]\$cimProcess\.Name\) -ine \$Entry\.Name/);
+  assert.match(windowsLifecycle, /\$actualPath -ine \$expectedPath/);
+  assert.match(windowsLifecycle, /-Phase "before upgrade"/);
+  assert.match(windowsLifecycle, /-Phase "after upgrade"/);
+  assert.match(windowsLifecycle, /-Phase "after uninstall"/);
+  assert.match(windowsLifecycle, /\[System\.IO\.FileShare\]::None/);
+  assert.match(windowsLifecycle, /cleanup_failed -> SetErrorLevel 2/);
+  assert.match(windowsLifecycle, /\$failedUninstallExitCode -ne 2/);
+  assert.match(windowsLifecycle, /Failed quiet uninstall removed owned state/);
+
+  assert.match(windowsQuietUninstallBootstrap, /Copy-Item[\s\S]*?\$temporaryUninstaller/);
+  assert.match(windowsQuietUninstallBootstrap, /Arguments = "\/S _\?=\$normalizedInstallDir"/);
+  assert.match(windowsQuietUninstallBootstrap, /\$childExitCode = \$process\.ExitCode/);
+  assert.match(
+    windowsQuietUninstallBootstrap,
+    /if \(\$childExitCode -eq 0\)[\s\S]*?Remove-Item -LiteralPath \$actualBootstrap/,
+  );
+  assert.match(windowsQuietUninstallBootstrap, /exit \$childExitCode/);
+
+  assert.match(windowsInstallRepair, /quiet-uninstall-bootstrap\.ps1/);
+  assert.match(windowsInstallRepair, /WindowsPowerShell[\\/]+v1\.0[\\/]+powershell\.exe/);
+  assert.doesNotMatch(windowsInstallRepair, /format!\("\{uninstall_command\} \/S"\)/);
   assert.match(buildWorkflow, /scripts\/uapi\/tests\/windows-installer-lifecycle\.ps1/);
 });
 
@@ -258,6 +365,41 @@ test("release jobs use immutable source and least-privilege publication", () => 
       );
     }
   }
+});
+
+test("Windows U-API builds pin and verify the NSIS compiler", () => {
+  for (const [name, workflow] of [
+    ["build", buildWorkflow],
+    ["release", releaseWorkflow],
+  ]) {
+    assert.match(workflow, /- name: Install pinned NSIS/);
+    assert.match(workflow, /choco install nsis[\s\S]*?--version=3\.12\.0/);
+    assert.match(workflow, /--allow-downgrade/);
+    assert.match(
+      workflow,
+      /--source=https:\/\/community\.chocolatey\.org\/api\/v2\//,
+      `${name} workflow must use the official Chocolatey Community source`,
+    );
+    assert.match(
+      workflow,
+      /\$compilerVersion = \(& \$makensis \/VERSION 2>&1 \| Out-String\)\.Trim\(\)/,
+    );
+    assert.match(workflow, /\$compilerVersion -ne "v3\.12"/);
+    assert.equal(
+      (workflow.match(/\$compilerVersion = \(& \$makensis \/VERSION 2>&1 \| Out-String\)\.Trim\(\)/g) ?? [])
+        .length,
+      2,
+      `${name} workflow must verify NSIS both after install and immediately before compilation`,
+    );
+    assert.doesNotMatch(workflow, /\$makensis\s*=\s*"makensis"/);
+  }
+
+  const nsisStep = releaseWorkflow.indexOf("- name: Install pinned NSIS");
+  const signingStep = releaseWorkflow.indexOf("- name: Prepare optional Authenticode certificate");
+  assert.ok(
+    nsisStep >= 0 && nsisStep < signingStep,
+    "NSIS must be verified before importing signing credentials",
+  );
 });
 
 test("macOS U-API packages use the fixed distribution and valid bundle versions", () => {

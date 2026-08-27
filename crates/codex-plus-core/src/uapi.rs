@@ -25,6 +25,8 @@ const DEFAULT_CONTEXT_WINDOW: &str = "128000";
 const LARGE_CONTEXT_WINDOW: &str = "272000";
 const MAX_MODEL_ID_LEN: usize = 200;
 const OFFICIAL_RELAY_ID: &str = "uapi_official";
+const OFFICIAL_CODEX_PROVIDER_ID: &str = "openai";
+const REFRESH_REQUEST_MARKER: &str = ".uapi-connect-refresh-request";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -171,9 +173,12 @@ fn status_from_home_with_vault_locked(
         .unwrap_or_default();
     let compatible_models = profile.as_ref().map(profile_model_ids).unwrap_or_default();
     let official_auth = crate::relay_config::chatgpt_auth_status_from_home(home);
-    let official_login_saved = stored_official_auth
-        .as_deref()
-        .is_some_and(official_auth_contents_are_valid);
+    let official_login_saved = stored_official_auth.as_deref().is_some_and(|contents| {
+        sanitize_stored_official_auth_contents(contents)
+            .ok()
+            .flatten()
+            .is_some()
+    });
     let current_model = live
         .model
         .filter(|model| contains_model(&compatible_models, model))
@@ -189,9 +194,12 @@ fn status_from_home_with_vault_locked(
         && !api_key.trim().is_empty()
         && !compatible_models.is_empty();
     let connection_mode = connection_mode(&settings);
+    let uapi_is_exactly_active = settings.relay_profiles_enabled
+        && settings.active_relay_id == distribution::FIXED_PROVIDER_ID
+        && settings.active_aggregate_relay_id.trim().is_empty();
     UapiStatus {
         configured,
-        active: connection_mode == UapiConnectionMode::Uapi,
+        active: uapi_is_exactly_active,
         connection_mode,
         uapi_ready: !api_key.trim().is_empty() && !compatible_models.is_empty(),
         official_login_saved,
@@ -237,10 +245,30 @@ fn connection_mode(settings: &BackendSettings) -> UapiConnectionMode {
     }
 }
 
+fn active_connection_mode_for_launch(
+    settings: &BackendSettings,
+) -> anyhow::Result<Option<UapiConnectionMode>> {
+    if !settings.relay_profiles_enabled {
+        return Ok(None);
+    }
+    if !settings.active_aggregate_relay_id.trim().is_empty() {
+        anyhow::bail!("当前激活了聚合中转，拒绝覆盖 Codex 实时连接");
+    }
+    match settings.active_relay_id.as_str() {
+        distribution::FIXED_PROVIDER_ID => Ok(Some(UapiConnectionMode::Uapi)),
+        OFFICIAL_RELAY_ID => Ok(Some(UapiConnectionMode::Official)),
+        _ => anyhow::bail!("当前激活的中转不属于 U-API Connect，拒绝覆盖 Codex 实时连接"),
+    }
+}
+
 fn official_auth_contents_are_valid(contents: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(contents) else {
         return false;
     };
+    value.get("OPENAI_API_KEY").is_none() && official_auth_value_has_valid_tokens(&value)
+}
+
+fn official_auth_value_has_valid_tokens(value: &Value) -> bool {
     let is_chatgpt = value
         .get("auth_mode")
         .and_then(Value::as_str)
@@ -259,6 +287,61 @@ fn official_auth_contents_are_valid(contents: &str) -> bool {
                             .is_some_and(|token| !token.trim().is_empty())
                     })
             })
+}
+
+fn sanitize_live_official_auth_contents(
+    contents: &str,
+    owned_api_keys: &[String],
+) -> anyhow::Result<Option<String>> {
+    let Ok(mut value) = serde_json::from_str::<Value>(contents) else {
+        return Ok(None);
+    };
+    if !official_auth_value_has_valid_tokens(&value) {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let key_may_be_removed = match object.get("OPENAI_API_KEY") {
+        None => return Ok(Some(contents.to_string())),
+        Some(Value::Null) => true,
+        Some(Value::String(api_key)) if api_key.trim().is_empty() => true,
+        Some(Value::String(api_key)) => owned_api_keys
+            .iter()
+            .any(|owned| owned.trim() == api_key.trim()),
+        Some(_) => false,
+    };
+    if !key_may_be_removed {
+        anyhow::bail!("Codex 实时 auth.json 的官方登录中夹带无法确认归属的 API Key");
+    }
+    object.remove("OPENAI_API_KEY");
+    let sanitized = serde_json::to_string_pretty(&value)?;
+    if !official_auth_contents_are_valid(&sanitized) {
+        anyhow::bail!("Codex 实时官方登录净化后无效");
+    }
+    Ok(Some(sanitized))
+}
+
+fn sanitize_stored_official_auth_contents(contents: &str) -> anyhow::Result<Option<String>> {
+    let Ok(mut value) = serde_json::from_str::<Value>(contents) else {
+        return Ok(None);
+    };
+    if !official_auth_value_has_valid_tokens(&value) {
+        return Ok(None);
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let removed_api_key = object.remove("OPENAI_API_KEY").is_some();
+    let sanitized = if removed_api_key {
+        serde_json::to_string_pretty(&value)?
+    } else {
+        contents.to_string()
+    };
+    if !official_auth_contents_are_valid(&sanitized) {
+        anyhow::bail!("已存官方登录快照净化后无效");
+    }
+    Ok(Some(sanitized))
 }
 
 pub fn enforce_distribution_defaults() -> anyhow::Result<()> {
@@ -282,15 +365,19 @@ pub async fn validate_key(api_key: &str) -> anyhow::Result<UapiModelDiscovery> {
 
 pub async fn configure(api_key: &str) -> anyhow::Result<UapiApplyResult> {
     let api_key = normalize_api_key(api_key)?;
-    let discovery = discover_models(&api_key).await?;
     let vault = SystemCredentialVault::default();
     let store = SettingsStore::default();
-    prepare_default_distribution_state(&store, &vault)?;
-    apply_discovery_with(
+    let home = crate::codex_home::default_codex_home_dir();
+    let request_guard = crate::relay_config::with_live_files_transaction(&home, || {
+        begin_model_request(&store, &home)
+    })?;
+    let discovery = discover_models(&api_key).await?;
+    apply_configured_discovery_with_guard(
         &store,
-        &crate::codex_home::default_codex_home_dir(),
+        &home,
         &vault,
         &api_key,
+        &request_guard,
         discovery,
     )
 }
@@ -300,7 +387,7 @@ pub async fn refresh_models() -> anyhow::Result<UapiApplyResult> {
     let vault = SystemCredentialVault::default();
     let home = crate::codex_home::default_codex_home_dir();
     prepare_default_distribution_state(&store, &vault)?;
-    let (api_key, migration_succeeded) =
+    let (api_key, migration_succeeded, refresh_guard) =
         crate::relay_config::with_live_files_transaction(&home, || {
             let mut settings = store.load().context("读取本地连接配置失败")?;
             let migration_succeeded = migrate_legacy_managed_api_key_best_effort(
@@ -310,16 +397,17 @@ pub async fn refresh_models() -> anyhow::Result<UapiApplyResult> {
                 "uapi.legacy_credential_migration_deferred_before_refresh",
             );
             let api_key = managed_api_key(&settings, &vault, &home)?;
-            Ok((api_key, migration_succeeded))
+            let refresh_guard = begin_model_refresh_request(&store, &home, &settings, &api_key)?;
+            Ok((api_key, migration_succeeded, refresh_guard))
         })?;
     let discovery = discover_models(&api_key).await?;
-    apply_discovery_with_options(
+    apply_refreshed_discovery_with_guard(
         &store,
         &home,
         &vault,
         &api_key,
+        &refresh_guard,
         discovery,
-        false,
         !migration_succeeded,
     )
 }
@@ -374,19 +462,41 @@ fn apply_active_connection_profile_locked(
     vault: &impl CredentialVault,
 ) -> anyhow::Result<()> {
     let mut settings = store.load().context("读取 U-API Connect 设置失败")?;
+    let Some(initial_mode) = active_connection_mode_for_launch(&settings)? else {
+        return Ok(());
+    };
+    let preflight_uapi_key = if initial_mode == UapiConnectionMode::Uapi {
+        let api_key = managed_api_key(&settings, vault, home)?;
+        if let Some(contents) = preflight_automatic_uapi_auth(home, &api_key)? {
+            vault
+                .set(CredentialSlot::OfficialAuthJson, &contents)
+                .context("保存最新官方登录失败，为避免丢失已保留 Codex 实时登录")?;
+        }
+        Some(api_key)
+    } else {
+        None
+    };
     migrate_legacy_managed_api_key_best_effort(
         store,
         &mut settings,
         vault,
         "uapi.legacy_credential_migration_deferred_before_launch",
     );
-    if !settings.relay_profiles_enabled {
-        return Ok(());
+    let mode = active_connection_mode_for_launch(&settings)?
+        .ok_or_else(|| anyhow::anyhow!("启动前 U-API Connect 模式发生变化"))?;
+    if mode != initial_mode {
+        anyhow::bail!("启动前 U-API Connect 模式发生变化，拒绝覆盖实时连接");
     }
 
-    match connection_mode(&settings) {
+    match mode {
         UapiConnectionMode::Uapi => {
             let api_key = managed_api_key(&settings, vault, home)?;
+            if preflight_uapi_key
+                .as_deref()
+                .is_none_or(|preflight_key| preflight_key.trim() != api_key.trim())
+            {
+                anyhow::bail!("启动自修复前后 U-API 密钥已改变，拒绝覆盖实时连接");
+            }
             let mut profile = managed_profile(&settings)?;
             prioritize_profile_models(&mut profile);
             let profile = hydrate_managed_profile(&profile, &api_key)?;
@@ -397,8 +507,14 @@ fn apply_active_connection_profile_locked(
             )?;
         }
         UapiConnectionMode::Official => {
-            let auth_contents = official_auth_for_launch(home, vault)?;
-            clear_managed_config_for_official(home, auth_contents.as_deref())?;
+            let auth_contents = stored_official_auth_best_effort(
+                vault,
+                "uapi.official_auth_snapshot_unavailable_before_launch",
+            );
+            clear_managed_config_for_official(home, auth_contents.as_deref(), &settings, vault)?;
+            // 先完成实时文件的归属校验和密钥剥离，再从最终
+            // auth.json 刷新快照，避免失败转换提前污染凭证库。
+            let _ = official_auth_for_launch(home, vault)?;
         }
     }
     Ok(())
@@ -493,6 +609,7 @@ fn parse_model_discovery(endpoint: &str, payload: &Value) -> anyhow::Result<Uapi
     })
 }
 
+#[cfg(test)]
 fn apply_discovery_with(
     store: &SettingsStore,
     home: &Path,
@@ -520,6 +637,201 @@ fn apply_discovery_with_options(
             api_key,
             discovery,
             persist_api_key,
+            preserve_legacy_api_key,
+        )
+    })
+}
+
+fn apply_configured_discovery_with_guard(
+    store: &SettingsStore,
+    home: &Path,
+    vault: &impl CredentialVault,
+    api_key: &str,
+    request_guard: &ModelRefreshGuard,
+    discovery: UapiModelDiscovery,
+) -> anyhow::Result<UapiApplyResult> {
+    apply_configured_discovery_with_guard_and_prepare(
+        store,
+        home,
+        vault,
+        api_key,
+        request_guard,
+        discovery,
+        || {
+            migrate_legacy_distribution_state_with(
+                store,
+                &crate::paths::default_settings_path(),
+                &crate::paths::legacy_upstream_settings_path(),
+                vault,
+            )
+        },
+    )
+}
+
+fn apply_configured_discovery_with_guard_and_prepare<F>(
+    store: &SettingsStore,
+    home: &Path,
+    vault: &impl CredentialVault,
+    api_key: &str,
+    request_guard: &ModelRefreshGuard,
+    discovery: UapiModelDiscovery,
+    prepare: F,
+) -> anyhow::Result<UapiApplyResult>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    crate::relay_config::with_live_files_transaction(home, || {
+        ensure_model_request_is_current(store, home, request_guard)?;
+        // 旧版迁移可能写设置或凭证，必须在请求代次和原始状态
+        // 都复核通过之后才允许执行。同一文件事务锁会一直持有到 apply 结束。
+        prepare()?;
+        apply_discovery_with_options_locked(store, home, vault, api_key, discovery, true, false)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelRefreshStateSnapshot {
+    settings: Option<Vec<u8>>,
+    config: Option<Vec<u8>>,
+    auth: Option<Vec<u8>>,
+    managed_catalog: Option<Vec<u8>>,
+}
+
+impl ModelRefreshStateSnapshot {
+    fn capture(store: &SettingsStore, home: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            settings: store
+                .snapshot_bytes()
+                .context("读取模型刷新前设置快照失败")?,
+            config: read_optional_bytes(&home.join("config.toml"))
+                .context("读取模型刷新前 config.toml 快照失败")?,
+            auth: read_optional_bytes(&home.join("auth.json"))
+                .context("读取模型刷新前 auth.json 快照失败")?,
+            managed_catalog: read_optional_bytes(&managed_catalog_path(home))
+                .context("读取模型刷新前模型目录快照失败")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ModelRefreshGuard {
+    request_id: String,
+    state: ModelRefreshStateSnapshot,
+}
+
+fn refresh_request_marker_path(home: &Path) -> std::path::PathBuf {
+    home.join(REFRESH_REQUEST_MARKER)
+}
+
+fn begin_model_request(store: &SettingsStore, home: &Path) -> anyhow::Result<ModelRefreshGuard> {
+    let state = ModelRefreshStateSnapshot::capture(store, home)?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let marker_path = refresh_request_marker_path(home);
+    let previous_marker =
+        read_optional_bytes(&marker_path).context("读取上一个模型请求标记失败")?;
+    if let Err(error) = crate::settings::atomic_write(&marker_path, request_id.as_bytes()) {
+        if let Err(rollback_error) = restore_optional_file(&marker_path, previous_marker.as_deref())
+        {
+            anyhow::bail!(
+                "记录模型请求失败，且旧标记回滚失败：写入={error}，回滚={rollback_error}"
+            );
+        }
+        return Err(error).context("记录模型请求失败");
+    }
+    Ok(ModelRefreshGuard { request_id, state })
+}
+
+fn ensure_model_request_is_current(
+    store: &SettingsStore,
+    home: &Path,
+    request_guard: &ModelRefreshGuard,
+) -> anyhow::Result<()> {
+    let current_request_id = match std::fs::read_to_string(refresh_request_marker_path(home)) {
+        Ok(request_id) => request_id,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            anyhow::bail!("模型请求已被更新的操作取代，已丢弃过期结果")
+        }
+        Err(error) => return Err(error).context("读取模型请求标记失败"),
+    };
+    if current_request_id != request_guard.request_id {
+        anyhow::bail!("模型请求已被更新的操作取代，已丢弃过期结果");
+    }
+    let current_state = ModelRefreshStateSnapshot::capture(store, home)?;
+    if current_state != request_guard.state {
+        anyhow::bail!("模型请求期间本地连接状态已改变，已丢弃过期结果");
+    }
+    Ok(())
+}
+
+fn ensure_model_refresh_target_is_active(settings: &BackendSettings) -> anyhow::Result<()> {
+    if !settings.relay_profiles_enabled
+        || settings.active_relay_id != distribution::FIXED_PROVIDER_ID
+        || !settings.active_aggregate_relay_id.trim().is_empty()
+    {
+        anyhow::bail!("模型刷新期间连接模式已改变，已丢弃过期结果");
+    }
+    Ok(())
+}
+
+fn ensure_live_model_refresh_projection(home: &Path, api_key: &str) -> anyhow::Result<()> {
+    let live = read_live_managed_state(home);
+    if !live.provider_matches || !live.base_url_matches {
+        anyhow::bail!("Codex 实时配置已被其他供应商接管，已停止刷新模型");
+    }
+    let auth_contents =
+        std::fs::read_to_string(home.join("auth.json")).context("读取模型刷新前 auth.json 失败")?;
+    let auth = serde_json::from_str::<Value>(&auth_contents)
+        .context("Codex 实时 auth.json 已损坏，已停止刷新模型")?;
+    let object = auth
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Codex 实时 auth.json 根节点不是 JSON 对象"))?;
+    let live_key = object
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    if object.len() != 1 || live_key != Some(api_key.trim()) {
+        anyhow::bail!("Codex 实时 auth.json 已被外部修改，已停止刷新模型");
+    }
+    Ok(())
+}
+
+fn begin_model_refresh_request(
+    store: &SettingsStore,
+    home: &Path,
+    settings: &BackendSettings,
+    api_key: &str,
+) -> anyhow::Result<ModelRefreshGuard> {
+    ensure_model_refresh_target_is_active(settings)?;
+    ensure_live_model_refresh_projection(home, api_key)?;
+    begin_model_request(store, home)
+}
+
+fn apply_refreshed_discovery_with_guard(
+    store: &SettingsStore,
+    home: &Path,
+    vault: &impl CredentialVault,
+    requested_api_key: &str,
+    refresh_guard: &ModelRefreshGuard,
+    discovery: UapiModelDiscovery,
+    preserve_legacy_api_key: bool,
+) -> anyhow::Result<UapiApplyResult> {
+    crate::relay_config::with_live_files_transaction(home, || {
+        let settings = store.load().context("读取本地连接配置失败")?;
+        ensure_model_refresh_target_is_active(&settings)?;
+        let current_api_key = managed_api_key(&settings, vault, home)?;
+        if current_api_key.trim() != requested_api_key.trim() {
+            anyhow::bail!("模型刷新期间服务密钥已改变，已丢弃过期结果");
+        }
+        ensure_model_request_is_current(store, home, refresh_guard)?;
+        ensure_live_model_refresh_projection(home, &current_api_key)?;
+        apply_discovery_with_options_locked(
+            store,
+            home,
+            vault,
+            requested_api_key,
+            discovery,
+            false,
             preserve_legacy_api_key,
         )
     })
@@ -559,7 +871,30 @@ fn apply_discovery_with_options_locked(
     if preserve_legacy_api_key {
         preserve_legacy_key_in_profile(existing_managed_profile.as_ref(), &mut profile, api_key)?;
     }
-    let live_official_auth = capture_live_official_auth(home)?;
+    let mut owned_api_keys = Vec::new();
+    collect_owned_profile_keys(&settings.relay_profiles, &mut owned_api_keys);
+    match stored_managed_api_key(&settings, vault) {
+        Ok(Some(stored_api_key)) => {
+            let stored_api_key = stored_api_key.trim();
+            if !stored_api_key.is_empty()
+                && !owned_api_keys
+                    .iter()
+                    .any(|owned| owned.trim() == stored_api_key)
+            {
+                owned_api_keys.push(stored_api_key.to_string());
+            }
+        }
+        Ok(None) => {}
+        Err(error) if persist_api_key && owned_api_keys.is_empty() => {
+            return Err(error).context("读取当前 U-API 密钥失败，无法确认旧实时凭证归属");
+        }
+        Err(_) => {}
+    }
+    let api_key = api_key.trim();
+    if !owned_api_keys.iter().any(|owned| owned.trim() == api_key) {
+        owned_api_keys.push(api_key.to_string());
+    }
+    let live_official_auth = capture_live_official_auth_with_owned_keys(home, &owned_api_keys)?;
     let profile_for_apply = hydrate_managed_profile(&profile, api_key)?;
     upsert_managed_profile(&mut settings, profile);
     apply_distribution_feature_defaults(&mut settings);
@@ -716,7 +1051,8 @@ fn switch_to_uapi(
             &api_key,
         )?;
     }
-    let live_official_auth = capture_live_official_auth(home)?;
+    let owned_api_keys = [api_key.clone()];
+    let live_official_auth = capture_live_official_auth_with_owned_keys(home, &owned_api_keys)?;
     let profile_for_apply = hydrate_managed_profile(&profile, &api_key)?;
 
     upsert_managed_profile(&mut settings, profile);
@@ -777,20 +1113,12 @@ fn switch_to_official(
         vault,
         "uapi.legacy_credential_migration_deferred_before_official_switch",
     );
-    let live_official_auth = capture_live_official_auth(home)?;
-    // 实时 auth.json 可能刚被 Codex 刷新；它有效时就是唯一权威来源，
-    // 不应再让损坏或过期的存储快照阻断切换。
-    let saved_official_auth = if live_official_auth.is_none() {
-        stored_official_auth_best_effort(
-            vault,
-            "uapi.official_auth_snapshot_unavailable_before_official_switch",
-        )
-    } else {
-        None
-    };
-    let auth_to_restore = live_official_auth
-        .as_deref()
-        .or(saved_official_auth.as_deref());
+    // 此时只读取已存的纯官方快照。实时 auth.json 的归属判定、
+    // owned key 剥离和最新 token 选择都由后面的文件事务完成。
+    let saved_official_auth = stored_official_auth_best_effort(
+        vault,
+        "uapi.official_auth_snapshot_unavailable_before_official_switch",
+    );
 
     if migration_succeeded {
         if let Some(profile) = settings
@@ -820,11 +1148,11 @@ fn switch_to_official(
     settings.active_aggregate_relay_id.clear();
 
     let applied = commit_connection_change(store, home, vault, &settings, None, None, || {
-        clear_managed_config_for_official(home, auth_to_restore)
+        clear_managed_config_for_official(home, saved_official_auth.as_deref(), &settings, vault)
     })?;
-    // 实时登录已经留在 auth.json 中，存储同步失败不能让可用的官方模式
-    // 回滚。后续状态检查和启动还会继续尝试同步。
-    if let Some(contents) = live_official_auth.as_deref() {
+    // 只有归属校验和文件转换成功后，才从最终 auth.json 刷新纯官方
+    // 快照。存储同步失败不回滚已可用的官方实时登录。
+    if let Some(contents) = capture_live_official_auth(home)?.as_deref() {
         if let Err(error) = vault.set(CredentialSlot::OfficialAuthJson, contents) {
             record_nonfatal_credential_error(
                 "uapi.official_auth_snapshot_refresh_failed_after_official_switch",
@@ -919,6 +1247,13 @@ fn prepare_distribution_state_with(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyConnectionState {
+    Inactive,
+    Uapi,
+    Official,
+}
+
 fn migrate_legacy_distribution_state_with(
     store: &SettingsStore,
     isolated_settings_path: &Path,
@@ -947,10 +1282,10 @@ fn migrate_legacy_distribution_state_with(
             .any(|profile| canonicalize_managed_profile(profile).is_ok())
     });
     let legacy_has_owned_marker = legacy_settings_has_owned_marker(legacy_settings_path)?;
-    let (legacy_profiles, legacy_mode) = if legacy_has_owned_marker {
+    let (legacy_profiles, legacy_connection_state) = if legacy_has_owned_marker {
         read_legacy_managed_profiles(legacy_settings_path)?
     } else {
-        (Vec::new(), UapiConnectionMode::Uapi)
+        (Vec::new(), LegacyConnectionState::Inactive)
     };
     if legacy_has_owned_marker && legacy_profiles.is_empty() {
         anyhow::bail!("检测到旧版 U-API 标记，但无法确认可安全迁移的 profile；旧版数据未改动");
@@ -985,10 +1320,12 @@ fn migrate_legacy_distribution_state_with(
             isolated_settings.relay_profiles.clear();
         }
         upsert_managed_profile(isolated_settings, profile);
-        isolated_settings.relay_profiles_enabled = true;
-        isolated_settings.active_relay_id = match legacy_mode {
-            UapiConnectionMode::Uapi => distribution::FIXED_PROVIDER_ID.to_string(),
-            UapiConnectionMode::Official => OFFICIAL_RELAY_ID.to_string(),
+        isolated_settings.relay_profiles_enabled =
+            legacy_connection_state != LegacyConnectionState::Inactive;
+        isolated_settings.active_relay_id = match legacy_connection_state {
+            LegacyConnectionState::Inactive => String::new(),
+            LegacyConnectionState::Uapi => distribution::FIXED_PROVIDER_ID.to_string(),
+            LegacyConnectionState::Official => OFFICIAL_RELAY_ID.to_string(),
         };
         isolated_settings.active_aggregate_relay_id.clear();
         apply_distribution_feature_defaults(isolated_settings);
@@ -1059,11 +1396,11 @@ fn legacy_settings_has_owned_marker(path: &Path) -> anyhow::Result<bool> {
 
 fn read_legacy_managed_profiles(
     path: &Path,
-) -> anyhow::Result<(Vec<RelayProfile>, UapiConnectionMode)> {
+) -> anyhow::Result<(Vec<RelayProfile>, LegacyConnectionState)> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok((Vec::new(), UapiConnectionMode::Uapi));
+            return Ok((Vec::new(), LegacyConnectionState::Inactive));
         }
         Err(error) => {
             return Err(error).with_context(|| format!("读取旧版共享设置失败：{}", path.display()));
@@ -1087,12 +1424,23 @@ fn read_legacy_managed_profiles(
                 .context("旧版 U-API profile 包含无法迁移的字段；为避免丢失密钥，旧版数据未改动")?,
         );
     }
-    let mode = if object.get("activeRelayId").and_then(Value::as_str) == Some(OFFICIAL_RELAY_ID) {
-        UapiConnectionMode::Official
-    } else {
-        UapiConnectionMode::Uapi
+    let enabled = object.get("relayProfilesEnabled").and_then(Value::as_bool) == Some(true);
+    let aggregate_is_empty = match object.get("activeAggregateRelayId") {
+        None => true,
+        Some(value) => value
+            .as_str()
+            .is_some_and(|aggregate| aggregate.trim().is_empty()),
     };
-    Ok((profiles, mode))
+    let connection_state = if enabled && aggregate_is_empty {
+        match object.get("activeRelayId").and_then(Value::as_str) {
+            Some(distribution::FIXED_PROVIDER_ID) => LegacyConnectionState::Uapi,
+            Some(OFFICIAL_RELAY_ID) => LegacyConnectionState::Official,
+            _ => LegacyConnectionState::Inactive,
+        }
+    } else {
+        LegacyConnectionState::Inactive
+    };
+    Ok((profiles, connection_state))
 }
 
 fn collect_owned_profile_keys(profiles: &[RelayProfile], keys: &mut Vec<String>) {
@@ -1383,9 +1731,10 @@ fn stored_managed_api_key(
 }
 
 fn stored_official_auth(vault: &impl CredentialVault) -> anyhow::Result<Option<String>> {
-    Ok(vault
-        .get(CredentialSlot::OfficialAuthJson)?
-        .filter(|contents| official_auth_contents_are_valid(contents)))
+    let Some(contents) = vault.get(CredentialSlot::OfficialAuthJson)? else {
+        return Ok(None);
+    };
+    sanitize_stored_official_auth_contents(&contents)
 }
 
 fn stored_official_auth_best_effort(
@@ -1437,40 +1786,296 @@ fn record_nonfatal_credential_error(event: &str, error: &anyhow::Error) {
 }
 
 fn capture_live_official_auth(home: &Path) -> anyhow::Result<Option<String>> {
-    if !crate::relay_config::chatgpt_auth_status_from_home(home).authenticated {
+    capture_live_official_auth_with_owned_keys(home, &[])
+}
+
+fn capture_live_official_auth_with_owned_keys(
+    home: &Path,
+    owned_api_keys: &[String],
+) -> anyhow::Result<Option<String>> {
+    let contents = match std::fs::read_to_string(home.join("auth.json")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("读取当前官方登录信息失败"),
+    };
+    sanitize_live_official_auth_contents(&contents, owned_api_keys)
+}
+
+fn preflight_automatic_uapi_auth(
+    home: &Path,
+    expected_uapi_key: &str,
+) -> anyhow::Result<Option<String>> {
+    let contents = match std::fs::read_to_string(home.join("auth.json")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("读取启动前 Codex auth.json 失败"),
+    };
+    let value = serde_json::from_str::<Value>(&contents)
+        .context("Codex 实时 auth.json 已损坏，拒绝在启动时自动覆盖")?;
+    let object = value.as_object().ok_or_else(|| {
+        anyhow::anyhow!("Codex 实时 auth.json 根节点不是 JSON 对象，拒绝自动覆盖")
+    })?;
+    if object.is_empty() {
         return Ok(None);
     }
-    let contents =
-        std::fs::read_to_string(home.join("auth.json")).context("读取当前官方登录信息失败")?;
-    Ok(official_auth_contents_are_valid(&contents).then_some(contents))
+    let exact_owned_key_only = object.len() == 1
+        && object
+            .get("OPENAI_API_KEY")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.trim() == expected_uapi_key.trim());
+    if exact_owned_key_only {
+        return Ok(None);
+    }
+    let owned_api_keys = [expected_uapi_key.to_string()];
+    if let Some(contents) = sanitize_live_official_auth_contents(&contents, &owned_api_keys)? {
+        return Ok(Some(contents));
+    }
+    anyhow::bail!("Codex 实时 auth.json 不属于可安全自修复的 U-API 状态，拒绝自动覆盖")
 }
 
 fn clear_managed_config_for_official(
     home: &Path,
     auth_contents: Option<&str>,
+    settings: &BackendSettings,
+    vault: &impl CredentialVault,
 ) -> anyhow::Result<crate::relay_config::RelayApplyResult> {
     crate::relay_config::with_live_files_transaction(home, || {
-        clear_managed_config_for_official_locked(home, auth_contents)
+        clear_managed_config_for_official_locked(home, auth_contents, settings, vault)
     })
 }
 
 fn clear_managed_config_for_official_locked(
     home: &Path,
     auth_contents: Option<&str>,
+    settings: &BackendSettings,
+    vault: &impl CredentialVault,
 ) -> anyhow::Result<crate::relay_config::RelayApplyResult> {
-    let should_clear_model = read_live_managed_state(home).provider_matches;
-    let result = crate::relay_config::clear_relay_config_to_home_with_auth(home, auth_contents)?;
-    if should_clear_model {
-        let config_path = home.join("config.toml");
-        let contents = std::fs::read_to_string(&config_path).context("读取官方模式配置失败")?;
-        let mut document = contents
-            .parse::<DocumentMut>()
-            .context("官方模式配置格式无效")?;
-        document.as_table_mut().remove("model");
-        crate::settings::atomic_write(&config_path, document.to_string().as_bytes())
-            .context("清除中转默认模型失败")?;
+    let mut owned_api_keys = Vec::new();
+    collect_owned_profile_keys(&settings.relay_profiles, &mut owned_api_keys);
+    if let Ok(Some(api_key)) = stored_managed_api_key(settings, vault) {
+        let api_key = api_key.trim();
+        if !api_key.is_empty() && !owned_api_keys.iter().any(|existing| existing == api_key) {
+            owned_api_keys.push(api_key.to_string());
+        }
     }
-    Ok(result)
+
+    let config_path = home.join("config.toml");
+    let config_contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("读取官方模式 config.toml 失败"),
+    };
+    let mut config = config_contents
+        .as_deref()
+        .map(str::parse::<DocumentMut>)
+        .transpose()
+        .context("Codex 实时 config.toml 已损坏，拒绝切换官方模式")?;
+
+    let mut active_owned = false;
+    let mut provider_owned = false;
+    let mut catalog_owned = false;
+    if let Some(document) = config.as_ref() {
+        let active_provider = document
+            .get("model_provider")
+            .and_then(Item::as_str)
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty());
+        provider_owned = document
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(distribution::FIXED_PROVIDER_ID))
+            .and_then(Item::as_table_like)
+            .is_some_and(managed_provider_table_is_owned);
+        catalog_owned = document
+            .get("model_catalog_json")
+            .and_then(Item::as_str)
+            .is_some_and(|path| managed_catalog_pointer_matches(home, path));
+        active_owned = active_provider == Some(distribution::FIXED_PROVIDER_ID) && provider_owned;
+        if live_config_has_unowned_official_transport_override(document) {
+            anyhow::bail!("Codex 实时配置包含非 U-API 管理的官方传输覆盖，拒绝写入官方登录信息");
+        }
+        match active_provider {
+            Some(provider) if provider == distribution::FIXED_PROVIDER_ID && !provider_owned => {
+                anyhow::bail!("U-API 实时供应商配置已被修改，拒绝覆盖并切换官方模式");
+            }
+            Some(provider)
+                if provider != distribution::FIXED_PROVIDER_ID
+                    && provider != OFFICIAL_CODEX_PROVIDER_ID =>
+            {
+                anyhow::bail!("Codex 实时配置当前由其他供应商管理，拒绝覆盖并切换官方模式");
+            }
+            _ => {}
+        }
+    }
+
+    let auth_bytes = official_auth_transition_bytes(home, auth_contents, &owned_api_keys)?;
+    let mut config_changed = false;
+    if let Some(document) = config.as_mut() {
+        if active_owned {
+            document.as_table_mut().remove("model_provider");
+            document.as_table_mut().remove("model");
+            config_changed = true;
+        }
+        if catalog_owned {
+            document.as_table_mut().remove("model_catalog_json");
+            config_changed = true;
+        }
+        if provider_owned {
+            let providers_empty = document
+                .get_mut("model_providers")
+                .and_then(Item::as_table_mut)
+                .map(|providers| {
+                    providers.remove(distribution::FIXED_PROVIDER_ID);
+                    providers.is_empty()
+                })
+                .unwrap_or(false);
+            if providers_empty {
+                document.as_table_mut().remove("model_providers");
+            }
+            config_changed = true;
+        }
+    }
+
+    if config_changed || auth_bytes.is_some() {
+        let snapshot = UapiLiveFilesSnapshot::capture(home)
+            .context("读取切换官方模式前 Codex 实时配置快照失败")?;
+        let transition_result = (|| {
+            if config_changed {
+                let contents = config.as_ref().map(ToString::to_string).unwrap_or_default();
+                crate::settings::atomic_write(&config_path, contents.as_bytes())
+                    .context("清理 U-API 实时供应商配置失败")?;
+            }
+            if let Some(auth_bytes) = auth_bytes.as_deref() {
+                crate::settings::atomic_write_private(&home.join("auth.json"), auth_bytes)
+                    .context("恢复 Codex 官方登录信息失败")?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = transition_result {
+            if let Err(rollback_error) = snapshot.restore(home) {
+                anyhow::bail!(
+                    "切换官方模式失败，且实时配置回滚不完整：切换={error}，回滚={rollback_error}"
+                );
+            }
+            return Err(error);
+        }
+    }
+
+    let status = crate::relay_config::relay_config_status_from_home(home);
+    Ok(crate::relay_config::RelayApplyResult {
+        config_path: status.config_path,
+        backup_path: None,
+        configured: status.configured,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveAuthForOfficial {
+    Missing,
+    Empty,
+    Official,
+    SanitizedOfficial(Vec<u8>),
+    OfficialLike,
+    OwnedUapiKey(String),
+}
+
+fn classify_live_auth_for_official(
+    home: &Path,
+    owned_api_keys: &[String],
+) -> anyhow::Result<LiveAuthForOfficial> {
+    let contents = match std::fs::read_to_string(home.join("auth.json")) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(LiveAuthForOfficial::Missing);
+        }
+        Err(error) => return Err(error).context("读取官方模式 auth.json 失败"),
+    };
+    let value = serde_json::from_str::<Value>(&contents)
+        .context("Codex 实时 auth.json 已损坏，拒绝切换官方模式")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Codex 实时 auth.json 根节点不是 JSON 对象"))?;
+    if let Some(api_key) = object
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|api_key| !api_key.is_empty())
+    {
+        if owned_api_keys.iter().any(|owned| owned.trim() == api_key) {
+            return Ok(LiveAuthForOfficial::OwnedUapiKey(api_key.to_string()));
+        }
+        anyhow::bail!("Codex 实时 auth.json 包含无法确认归属的 API Key，拒绝切换官方模式");
+    }
+    if let Some(sanitized) = sanitize_live_official_auth_contents(&contents, owned_api_keys)? {
+        if sanitized == contents {
+            return Ok(LiveAuthForOfficial::Official);
+        }
+        return Ok(LiveAuthForOfficial::SanitizedOfficial(
+            sanitized.into_bytes(),
+        ));
+    }
+    if object
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("chatgpt"))
+    {
+        return Ok(LiveAuthForOfficial::OfficialLike);
+    }
+    if object.is_empty() {
+        return Ok(LiveAuthForOfficial::Empty);
+    }
+    anyhow::bail!("Codex 实时 auth.json 归属不明，拒绝切换官方模式")
+}
+
+fn official_auth_transition_bytes(
+    home: &Path,
+    auth_contents: Option<&str>,
+    owned_api_keys: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let saved_official_auth =
+        auth_contents.filter(|contents| official_auth_contents_are_valid(contents));
+    match classify_live_auth_for_official(home, owned_api_keys)? {
+        LiveAuthForOfficial::Missing
+        | LiveAuthForOfficial::Empty
+        | LiveAuthForOfficial::OfficialLike => {
+            Ok(saved_official_auth.map(|contents| contents.as_bytes().to_vec()))
+        }
+        LiveAuthForOfficial::Official => Ok(None),
+        LiveAuthForOfficial::SanitizedOfficial(contents) => Ok(Some(contents)),
+        LiveAuthForOfficial::OwnedUapiKey(api_key) => {
+            let stripped = remove_live_uapi_key_from_auth(home, &api_key)?
+                .ok_or_else(|| anyhow::anyhow!("U-API 实时密钥在切换前发生变化"))?;
+            let stripped_is_official = std::str::from_utf8(&stripped)
+                .ok()
+                .is_some_and(official_auth_contents_are_valid);
+            if stripped_is_official {
+                Ok(Some(stripped))
+            } else if let Some(contents) = saved_official_auth {
+                Ok(Some(contents.as_bytes().to_vec()))
+            } else {
+                Ok(Some(stripped))
+            }
+        }
+    }
+}
+
+fn live_config_has_unowned_official_transport_override(document: &DocumentMut) -> bool {
+    [
+        "OPENAI_API_KEY",
+        "base_url",
+        "openai_base_url",
+        "chatgpt_base_url",
+        "codex_plus_chat_base_url",
+        "experimental_bearer_token",
+        "env_key",
+        "requires_openai_auth",
+    ]
+    .iter()
+    .any(|key| document.get(*key).is_some())
+        || document
+            .get("model_providers")
+            .and_then(Item::as_table_like)
+            .is_some_and(|providers| providers.get(OFFICIAL_CODEX_PROVIDER_ID).is_some())
 }
 
 fn managed_profile_is_owned(profile: &RelayProfile) -> bool {
@@ -1661,6 +2266,8 @@ fn uninstall_cleanup_with_failure(
             ensure_managed_catalog_is_not_referenced(home)?;
             remove_file_if_present(&managed_catalog_path(home))
                 .context("删除 U-API 受管模型目录失败")?;
+            remove_file_if_present(&refresh_request_marker_path(home))
+                .context("删除 U-API 模型刷新请求标记失败")?;
             fail_uninstall_if_requested(failure_point, UninstallFailurePoint::AfterCatalogCleanup)?;
 
             // Credentials are the least recoverable part of the transaction,
@@ -1774,6 +2381,14 @@ fn cleanup_live_uapi_projection_locked(
         CapturedCredential::Unchanged | CapturedCredential::Missing => None,
     }
     .filter(|key| !key.trim().is_empty());
+    let mut all_owned_api_keys = owned_api_keys.to_vec();
+    if let Some(stored_uapi_key) = stored_uapi_key
+        && !all_owned_api_keys
+            .iter()
+            .any(|owned| owned.trim() == stored_uapi_key.trim())
+    {
+        all_owned_api_keys.push(stored_uapi_key.to_string());
+    }
     let live_auth_path = home.join("auth.json");
     let (live_auth_contents, live_auth_missing) = match std::fs::read_to_string(&live_auth_path) {
         Ok(contents) => (Some(contents), false),
@@ -1782,6 +2397,11 @@ fn cleanup_live_uapi_projection_locked(
         // The outer byte snapshot will still preserve or roll back the file.
         Err(_) => (None, false),
     };
+    if let Some(contents) = live_auth_contents.as_deref() {
+        // 有效官方 token 中若夹带非 owned key，不得以“保留原文件”
+        // 为由继续删除其他所有权证据，必须让外层整体回滚。
+        let _ = sanitize_live_official_auth_contents(contents, &all_owned_api_keys)?;
+    }
     let live_auth_is_official = live_auth_contents
         .as_deref()
         .is_some_and(official_auth_contents_are_valid);
@@ -1799,23 +2419,28 @@ fn cleanup_live_uapi_projection_locked(
     });
     let auth_bytes = if active_owned {
         let stored_official_auth = match &credential_snapshot.official_auth_json {
-            CapturedCredential::Present(contents) if official_auth_contents_are_valid(contents) => {
-                Some(contents.as_str())
+            CapturedCredential::Present(contents) => {
+                sanitize_stored_official_auth_contents(contents)?
             }
-            CapturedCredential::Unchanged
-            | CapturedCredential::Missing
-            | CapturedCredential::Present(_) => None,
+            CapturedCredential::Unchanged | CapturedCredential::Missing => None,
         };
-        if live_auth_is_official {
-            None
-        } else if let Some(matching_owned_key) = matching_owned_key {
-            if let Some(contents) = stored_official_auth {
+        if let Some(matching_owned_key) = matching_owned_key {
+            let stripped = remove_live_uapi_key_from_auth(home, matching_owned_key)?;
+            let stripped_is_official = stripped
+                .as_deref()
+                .and_then(|contents| std::str::from_utf8(contents).ok())
+                .is_some_and(official_auth_contents_are_valid);
+            if stripped_is_official {
+                stripped
+            } else if let Some(contents) = stored_official_auth.as_deref() {
                 Some(contents.as_bytes().to_vec())
             } else {
-                remove_live_uapi_key_from_auth(home, matching_owned_key)?
+                stripped
             }
+        } else if live_auth_is_official {
+            None
         } else if live_auth_missing {
-            stored_official_auth.map(|contents| contents.as_bytes().to_vec())
+            stored_official_auth.map(String::into_bytes)
         } else {
             None
         }
@@ -2061,6 +2686,7 @@ struct UapiLiveFilesSnapshot {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
     managed_catalog: Option<Vec<u8>>,
+    refresh_request_marker: Option<Vec<u8>>,
 }
 
 impl UapiLiveFilesSnapshot {
@@ -2069,6 +2695,7 @@ impl UapiLiveFilesSnapshot {
             config: read_optional_bytes(&home.join("config.toml"))?,
             auth: read_optional_bytes(&home.join("auth.json"))?,
             managed_catalog: read_optional_bytes(&managed_catalog_path(home))?,
+            refresh_request_marker: read_optional_bytes(&refresh_request_marker_path(home))?,
         })
     }
 
@@ -2081,14 +2708,24 @@ impl UapiLiveFilesSnapshot {
         let catalog_error =
             restore_optional_file(&managed_catalog_path(home), self.managed_catalog.as_deref())
                 .err();
-        if config_error.is_none() && auth_error.is_none() && catalog_error.is_none() {
+        let refresh_marker_error = restore_optional_file(
+            &refresh_request_marker_path(home),
+            self.refresh_request_marker.as_deref(),
+        )
+        .err();
+        if config_error.is_none()
+            && auth_error.is_none()
+            && catalog_error.is_none()
+            && refresh_marker_error.is_none()
+        {
             return Ok(());
         }
         anyhow::bail!(
-            "Codex 实时文件回滚不完整：config.toml={}，auth.json={}，model catalog={}",
+            "Codex 实时文件回滚不完整：config.toml={}，auth.json={}，model catalog={}，refresh marker={}",
             rollback_status(config_error),
             rollback_status(auth_error),
             rollback_status(catalog_error),
+            rollback_status(refresh_marker_error),
         )
     }
 }
@@ -2702,6 +3339,19 @@ mod tests {
             .unwrap();
     }
 
+    fn model_refresh_guard(store: &SettingsStore, home: &Path, api_key: &str) -> ModelRefreshGuard {
+        crate::relay_config::with_live_files_transaction(home, || {
+            let settings = store.load().unwrap();
+            begin_model_refresh_request(store, home, &settings, api_key)
+        })
+        .unwrap()
+    }
+
+    fn configure_request_guard(store: &SettingsStore, home: &Path) -> ModelRefreshGuard {
+        crate::relay_config::with_live_files_transaction(home, || begin_model_request(store, home))
+            .unwrap()
+    }
+
     fn candidate(id: &str, endpoints: &[&str]) -> ModelCandidate {
         ModelCandidate {
             id: id.to_string(),
@@ -3111,6 +3761,95 @@ mod tests {
             !managed
                 .config_contents
                 .contains("experimental_bearer_token")
+        );
+    }
+
+    fn assert_inactive_legacy_state_does_not_activate_after_migration(
+        relay_profiles_enabled: bool,
+        active_relay_id: &str,
+        active_aggregate_relay_id: &str,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        let mut managed =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let legacy_key = "test-inactive-legacy-key-012345";
+        managed.auth_contents =
+            serde_json::to_string(&json!({"OPENAI_API_KEY": legacy_key})).unwrap();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [serde_json::to_value(managed).unwrap()],
+                "relayProfilesEnabled": relay_profiles_enabled,
+                "activeRelayId": active_relay_id,
+                "activeAggregateRelayId": active_aggregate_relay_id,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config_before = b"model = \"foreign-model\"\nmodel_provider = \"foreign\"\n";
+        let auth_before = b"{\"OPENAI_API_KEY\":\"foreign-live-key\"}\n";
+        let catalog_before = b"{\"foreignCatalog\":true}\n";
+        std::fs::write(home.join("config.toml"), config_before).unwrap();
+        std::fs::write(home.join("auth.json"), auth_before).unwrap();
+        let catalog_path = managed_catalog_path(&home);
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        std::fs::write(&catalog_path, catalog_before).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+            .unwrap();
+
+        let migrated = store.load().unwrap();
+        assert!(!migrated.relay_profiles_enabled);
+        assert!(migrated.active_relay_id.is_empty());
+        assert!(migrated.active_aggregate_relay_id.is_empty());
+        assert!(migrated.relay_profiles.iter().any(managed_profile_is_owned));
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some(legacy_key)
+        );
+        assert!(
+            !std::fs::read_to_string(&isolated_path)
+                .unwrap()
+                .contains(legacy_key)
+        );
+
+        apply_active_connection_profile_with(&store, &home, &vault).unwrap();
+
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(std::fs::read(catalog_path).unwrap(), catalog_before);
+    }
+
+    #[test]
+    fn disabled_legacy_profile_migrates_without_becoming_active() {
+        assert_inactive_legacy_state_does_not_activate_after_migration(
+            false,
+            distribution::FIXED_PROVIDER_ID,
+            "",
+        );
+    }
+
+    #[test]
+    fn foreign_active_legacy_profile_migrates_without_becoming_active() {
+        assert_inactive_legacy_state_does_not_activate_after_migration(true, "foreign-relay", "");
+    }
+
+    #[test]
+    fn aggregated_legacy_profile_migrates_without_becoming_active() {
+        assert_inactive_legacy_state_does_not_activate_after_migration(
+            true,
+            distribution::FIXED_PROVIDER_ID,
+            "legacy-aggregate",
         );
     }
 
@@ -3699,6 +4438,536 @@ mod tests {
     }
 
     #[test]
+    fn older_configure_with_a_different_key_cannot_beat_the_latest_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        store.save(&BackendSettings::default()).unwrap();
+        let vault = MemoryCredentialVault::default();
+        let older = configure_request_guard(&store, &home);
+        let newer = configure_request_guard(&store, &home);
+        let prepare_called = std::cell::Cell::new(false);
+
+        let error = apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            "test-configure-key-a-012345",
+            &older,
+            discovery(&["gpt-5-codex"]),
+            || {
+                prepare_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("更新的操作取代"));
+        assert!(!prepare_called.get());
+        apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            "test-configure-key-b-987654",
+            &newer,
+            discovery(&["gpt-5.6-sol", "gpt-5-codex"]),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-configure-key-b-987654")
+        );
+    }
+
+    #[test]
+    fn older_same_key_configure_response_cannot_overwrite_the_newer_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        store.save(&BackendSettings::default()).unwrap();
+        let vault = MemoryCredentialVault::default();
+        let older = configure_request_guard(&store, &home);
+        let newer = configure_request_guard(&store, &home);
+
+        apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            "test-configure-same-key-012345",
+            &newer,
+            discovery(&["gpt-5.6-sol", "gpt-5-codex"]),
+            || Ok(()),
+        )
+        .unwrap();
+        let state_after_newer = ModelRefreshStateSnapshot::capture(&store, &home).unwrap();
+
+        let error = apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            "test-configure-same-key-012345",
+            &older,
+            discovery(&["gpt-5-codex"]),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("更新的操作取代"));
+        assert_eq!(
+            ModelRefreshStateSnapshot::capture(&store, &home).unwrap(),
+            state_after_newer
+        );
+        assert!(
+            managed_profile(&store.load().unwrap())
+                .unwrap()
+                .model_list
+                .contains("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn configure_saves_clean_fresh_tokens_from_mixed_live_auth_before_uapi_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+        let configure_key = "test-configure-mixed-key-012345";
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": configure_key,
+                "tokens": {
+                    "access_token": "fresh-configure-live-token",
+                    "refresh_token": "fresh-configure-live-refresh"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        store.save(&BackendSettings::default()).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                &official_auth_json_with_access_token("stale-configure-vault-token"),
+            )
+            .unwrap();
+        let request_guard = configure_request_guard(&store, &home);
+
+        apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            configure_key,
+            &request_guard,
+            discovery(&["gpt-5.6-sol"]),
+            || Ok(()),
+        )
+        .unwrap();
+
+        let stored: Value = serde_json::from_str(
+            &vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stored.get("OPENAI_API_KEY").is_none());
+        assert_eq!(
+            stored["tokens"]["access_token"],
+            "fresh-configure-live-token"
+        );
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(live["OPENAI_API_KEY"], configure_key);
+    }
+
+    #[test]
+    fn configure_key_rotation_preserves_tokens_mixed_with_the_previous_owned_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let old_key = "test-configure-old-owned-012345";
+        let new_key = "test-configure-new-owned-987654";
+        write_live_uapi(&home, &profile, old_key);
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": old_key,
+                "tokens": {
+                    "access_token": "fresh-rotation-live-token",
+                    "refresh_token": "fresh-rotation-live-refresh"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, old_key).unwrap();
+        let request_guard = configure_request_guard(&store, &home);
+
+        apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            new_key,
+            &request_guard,
+            discovery(&["gpt-5.6-sol"]),
+            || Ok(()),
+        )
+        .unwrap();
+
+        let stored_official: Value = serde_json::from_str(
+            &vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stored_official.get("OPENAI_API_KEY").is_none());
+        assert_eq!(
+            stored_official["tokens"]["access_token"],
+            "fresh-rotation-live-token"
+        );
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(live.as_object().unwrap().len(), 1);
+        assert_eq!(live["OPENAI_API_KEY"], new_key);
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some(new_key)
+        );
+        let persisted_settings =
+            std::fs::read_to_string(temp.path().join("settings.json")).unwrap();
+        assert!(!persisted_settings.contains(old_key));
+        assert!(!persisted_settings.contains(new_key));
+    }
+
+    #[test]
+    fn configure_response_is_discarded_when_mode_changes_while_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        write_live_uapi(&home, &profile, "test-configure-old-key-012345");
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-configure-old-key-012345")
+            .unwrap();
+        let request_guard = configure_request_guard(&store, &home);
+
+        let mut switched = store.load().unwrap();
+        switched.active_relay_id = OFFICIAL_RELAY_ID.to_string();
+        store.save(&switched).unwrap();
+        let settings_after_switch = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_after_switch = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_after_switch = std::fs::read(home.join("auth.json")).unwrap();
+        let prepare_called = std::cell::Cell::new(false);
+
+        let error = apply_configured_discovery_with_guard_and_prepare(
+            &store,
+            &home,
+            &vault,
+            "test-configure-new-key-987654",
+            &request_guard,
+            discovery(&["gpt-5.6-sol"]),
+            || {
+                prepare_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("本地连接状态已改变"));
+        assert!(!prepare_called.get());
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_after_switch
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_after_switch
+        );
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            auth_after_switch
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-configure-old-key-012345")
+        );
+    }
+
+    #[test]
+    fn stale_model_refresh_does_not_switch_back_from_official_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-old-0123456789")
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-refresh-old-0123456789");
+        let refresh_guard = model_refresh_guard(&store, &home, "sk-refresh-old-0123456789");
+
+        let mut switched = store.load().unwrap();
+        switched.active_relay_id = OFFICIAL_RELAY_ID.to_string();
+        store.save(&switched).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+
+        let error = apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-old-0123456789",
+            &refresh_guard,
+            discovery(&["gpt-5.6-sol"]),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("连接模式已改变"));
+        assert_eq!(store.load().unwrap().active_relay_id, OFFICIAL_RELAY_ID);
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+    }
+
+    #[test]
+    fn stale_model_refresh_does_not_overwrite_a_newer_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-old-0123456789")
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-refresh-old-0123456789");
+        let refresh_guard = model_refresh_guard(&store, &home, "sk-refresh-old-0123456789");
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-new-9876543210")
+            .unwrap();
+        let error = apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-old-0123456789",
+            &refresh_guard,
+            discovery(&["gpt-5.6-sol"]),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("服务密钥已改变"));
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("sk-refresh-new-9876543210")
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+    }
+
+    #[test]
+    fn stale_model_refresh_rejects_a_foreign_active_relay_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-own-0123456789")
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-refresh-own-0123456789");
+        let refresh_guard = model_refresh_guard(&store, &home, "sk-refresh-own-0123456789");
+
+        let mut changed = store.load().unwrap();
+        changed.active_relay_id = "foreign-relay".to_string();
+        store.save(&changed).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+
+        let error = apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-own-0123456789",
+            &refresh_guard,
+            discovery(&["gpt-5.6-sol"]),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("连接模式已改变"));
+        assert_eq!(store.load().unwrap().active_relay_id, "foreign-relay");
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+    }
+
+    #[test]
+    fn stale_model_refresh_rejects_a_disabled_relay_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-own-0123456789")
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-refresh-own-0123456789");
+        let refresh_guard = model_refresh_guard(&store, &home, "sk-refresh-own-0123456789");
+
+        let mut changed = store.load().unwrap();
+        changed.relay_profiles_enabled = false;
+        store.save(&changed).unwrap();
+
+        let error = apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-own-0123456789",
+            &refresh_guard,
+            discovery(&["gpt-5.6-sol"]),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("连接模式已改变"));
+        assert!(!store.load().unwrap().relay_profiles_enabled);
+    }
+
+    #[test]
+    fn stale_model_refresh_preserves_foreign_live_takeover_byte_for_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-own-0123456789")
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-refresh-own-0123456789");
+        let refresh_guard = model_refresh_guard(&store, &home, "sk-refresh-own-0123456789");
+
+        let foreign_config = b"model = \"foreign-model\"\nmodel_provider = \"foreign\"\n\n[model_providers.foreign]\nbase_url = \"https://foreign.example/v1\"\nwire_api = \"responses\"\n";
+        let foreign_auth = b"{\"OPENAI_API_KEY\":\"sk-foreign-live-0123456789\",\"keep\":true}\n";
+        std::fs::write(home.join("config.toml"), foreign_config).unwrap();
+        std::fs::write(home.join("auth.json"), foreign_auth).unwrap();
+
+        let error = apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-own-0123456789",
+            &refresh_guard,
+            discovery(&["gpt-5.6-sol"]),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("本地连接状态已改变"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            foreign_config
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), foreign_auth);
+    }
+
+    #[test]
+    fn newer_same_key_model_refresh_supersedes_an_older_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-refresh-own-0123456789")
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-refresh-own-0123456789");
+
+        let older = model_refresh_guard(&store, &home, "sk-refresh-own-0123456789");
+        let newer = model_refresh_guard(&store, &home, "sk-refresh-own-0123456789");
+        apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-own-0123456789",
+            &newer,
+            discovery(&["gpt-5.6-sol", "gpt-5-codex"]),
+            false,
+        )
+        .unwrap();
+        let state_after_newer = ModelRefreshStateSnapshot::capture(&store, &home).unwrap();
+
+        let error = apply_refreshed_discovery_with_guard(
+            &store,
+            &home,
+            &vault,
+            "sk-refresh-own-0123456789",
+            &older,
+            discovery(&["gpt-5-codex"]),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("更新的操作取代"));
+        assert_eq!(
+            ModelRefreshStateSnapshot::capture(&store, &home).unwrap(),
+            state_after_newer
+        );
+        assert!(
+            managed_profile(&store.load().unwrap())
+                .unwrap()
+                .model_list
+                .contains("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
     fn live_official_auth_wins_and_refreshes_stale_vault_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -3720,6 +4989,367 @@ mod tests {
     }
 
     #[test]
+    fn official_auth_with_null_api_key_is_sanitized_before_snapshotting() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let raw = serde_json::to_string_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "fresh-null-compatible-token",
+                "refresh_token": "fresh-null-compatible-refresh"
+            }
+        }))
+        .unwrap();
+        std::fs::write(home.join("auth.json"), raw).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        let sanitized = official_auth_for_launch(&home, &vault).unwrap().unwrap();
+        let value: Value = serde_json::from_str(&sanitized).unwrap();
+
+        assert!(value.get("OPENAI_API_KEY").is_none());
+        assert_eq!(
+            value["tokens"]["access_token"],
+            "fresh-null-compatible-token"
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(sanitized)
+        );
+    }
+
+    #[test]
+    fn uapi_launch_snapshots_fresh_official_auth_before_overwriting_live_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+        let fresh = official_auth_json_with_access_token("fresh-before-uapi-launch");
+        std::fs::write(home.join("auth.json"), &fresh).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-launch-uapi-key-012345")
+            .unwrap();
+        vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                &official_auth_json_with_access_token("stale-before-uapi-launch"),
+            )
+            .unwrap();
+
+        apply_active_connection_profile_with(&store, &home, &vault).unwrap();
+
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(fresh)
+        );
+        let live_auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(live_auth["OPENAI_API_KEY"], "test-launch-uapi-key-012345");
+    }
+
+    #[test]
+    fn uapi_launch_preserves_fresh_official_auth_when_snapshot_write_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+        let fresh = official_auth_json_with_access_token("fresh-preserved-on-vault-error");
+        std::fs::write(home.join("auth.json"), &fresh).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-launch-uapi-key-012345")
+            .unwrap();
+        let stale = official_auth_json_with_access_token("stale-preserved-on-vault-error");
+        vault.set(CredentialSlot::OfficialAuthJson, &stale).unwrap();
+        vault.fail_set(CredentialSlot::OfficialAuthJson);
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+
+        let error = apply_active_connection_profile_with(&store, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("保存最新官方登录失败"));
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(stale)
+        );
+    }
+
+    #[test]
+    fn uapi_launch_rejects_foreign_key_only_auth_without_mutating_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let owned_key = "test-startup-owned-key-012345";
+        write_live_uapi(&home, &profile, owned_key);
+        let foreign_auth = b"{\"OPENAI_API_KEY\":\"test-startup-foreign-key-987654\"}\n";
+        std::fs::write(home.join("auth.json"), foreign_auth).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+        let official = official_auth_json();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official)
+            .unwrap();
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+        let error = apply_active_connection_profile_with(&store, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("拒绝自动覆盖"));
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), foreign_auth);
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some(owned_key)
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(official)
+        );
+    }
+
+    #[test]
+    fn uapi_launch_rejects_damaged_or_unknown_auth_without_mutating_state() {
+        for auth_bytes in [
+            b"{not-valid-json\n".as_slice(),
+            b"{\"unknown\":true}\n".as_slice(),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            let store = SettingsStore::new(temp.path().join("settings.json"));
+            let profile =
+                build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+            store
+                .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+                .unwrap();
+            let owned_key = "test-startup-owned-key-012345";
+            write_live_uapi(&home, &profile, owned_key);
+            std::fs::write(home.join("auth.json"), auth_bytes).unwrap();
+            let vault = MemoryCredentialVault::default();
+            vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+            let official = official_auth_json();
+            vault
+                .set(CredentialSlot::OfficialAuthJson, &official)
+                .unwrap();
+            let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+            let config_before = std::fs::read(home.join("config.toml")).unwrap();
+            let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+            assert!(apply_active_connection_profile_with(&store, &home, &vault).is_err());
+
+            assert_eq!(
+                std::fs::read(temp.path().join("settings.json")).unwrap(),
+                settings_before
+            );
+            assert_eq!(
+                std::fs::read(home.join("config.toml")).unwrap(),
+                config_before
+            );
+            assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_bytes);
+            assert_eq!(
+                std::fs::read(managed_catalog_path(&home)).unwrap(),
+                catalog_before
+            );
+            assert_eq!(
+                vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+                Some(owned_key)
+            );
+            assert_eq!(
+                vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+                Some(official)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_rejects_unknown_active_relay_without_mutating_any_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let mut settings = managed_settings(profile.clone(), UapiConnectionMode::Uapi);
+        settings.active_relay_id = "foreign-active-relay".to_string();
+        store.save(&settings).unwrap();
+        write_live_uapi(&home, &profile, "test-launch-owned-key-012345");
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-launch-owned-key-012345")
+            .unwrap();
+        let official = official_auth_json();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official)
+            .unwrap();
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+        let error = apply_active_connection_profile_with(&store, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("不属于 U-API Connect"));
+        assert!(!status_from_home_with_vault(&home, &store, &vault).active);
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-launch-owned-key-012345")
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(official)
+        );
+    }
+
+    #[test]
+    fn launch_rejects_active_aggregate_without_mutating_any_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let mut settings = managed_settings(profile.clone(), UapiConnectionMode::Uapi);
+        settings.active_aggregate_relay_id = "foreign-aggregate".to_string();
+        store.save(&settings).unwrap();
+        write_live_uapi(&home, &profile, "test-launch-owned-key-012345");
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-launch-owned-key-012345")
+            .unwrap();
+        let official = official_auth_json();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official)
+            .unwrap();
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+        let error = apply_active_connection_profile_with(&store, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("聚合中转"));
+        assert!(!status_from_home_with_vault(&home, &store, &vault).active);
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-launch-owned-key-012345")
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(official)
+        );
+    }
+
+    #[test]
+    fn disabled_launch_ignores_stale_aggregate_without_mutating_any_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let mut settings = managed_settings(profile.clone(), UapiConnectionMode::Uapi);
+        settings.relay_profiles_enabled = false;
+        settings.active_aggregate_relay_id = "stale-disabled-aggregate".to_string();
+        store.save(&settings).unwrap();
+        write_live_uapi(&home, &profile, "test-disabled-owned-key-012345");
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-disabled-owned-key-012345")
+            .unwrap();
+        let official = official_auth_json();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official)
+            .unwrap();
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+        apply_active_connection_profile_with(&store, &home, &vault).unwrap();
+
+        assert!(!status_from_home_with_vault(&home, &store, &vault).active);
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-disabled-owned-key-012345")
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(official)
+        );
+    }
+
+    #[test]
     fn official_launch_without_live_auth_ignores_unavailable_saved_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -3733,6 +5363,9 @@ mod tests {
             .unwrap();
         write_live_uapi(&home, &profile, "sk-live-uapi-0123456789");
         let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-live-uapi-0123456789")
+            .unwrap();
         vault.fail_get(CredentialSlot::OfficialAuthJson);
 
         apply_active_connection_profile_with(&store, &home, &vault).unwrap();
@@ -3743,6 +5376,63 @@ mod tests {
             !std::fs::read_to_string(home.join("auth.json"))
                 .unwrap()
                 .contains("OPENAI_API_KEY")
+        );
+    }
+
+    #[test]
+    fn official_launch_rejects_foreign_live_config_without_mutating_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let foreign_config = b"# foreign owner\nmodel = \"foreign-model\"\nmodel_provider = \"foreign\"\nmodel_catalog_json = \"foreign-catalog.json\"\n\n[model_providers.foreign]\nbase_url = \"https://foreign.example/v1\"\nwire_api = \"responses\"\n";
+        let foreign_auth =
+            b"{\n  \"OPENAI_API_KEY\": \"sk-foreign-live-0123456789\",\n  \"foreign\": true\n}\n";
+        std::fs::write(home.join("config.toml"), foreign_config).unwrap();
+        std::fs::write(home.join("auth.json"), foreign_auth).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Official))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-uapi-owned-0123456789")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+
+        let error = apply_active_connection_profile_with(&store, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("其他供应商"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            foreign_config
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), foreign_auth);
+    }
+
+    #[test]
+    fn official_launch_restores_saved_login_into_an_empty_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Official))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        let official_auth = official_auth_json();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth)
+            .unwrap();
+
+        apply_active_connection_profile_with(&store, &home, &vault).unwrap();
+
+        assert!(!home.join("config.toml").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            official_auth
         );
     }
 
@@ -3837,6 +5527,337 @@ mod tests {
             live
         );
         assert_eq!(store.load().unwrap().active_relay_id, OFFICIAL_RELAY_ID);
+    }
+
+    #[test]
+    fn switching_to_official_rejects_foreign_live_files_and_rolls_back_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let foreign_config = b"# managed elsewhere\nmodel = \"foreign-model\"\nmodel_provider = \"foreign\"\n\n[model_providers.foreign]\nbase_url = \"https://foreign.example/v1\"\nwire_api = \"responses\"\n";
+        let foreign_auth = b"{\"OPENAI_API_KEY\":\"sk-foreign-live-0123456789\",\"keep\":1}\n";
+        std::fs::write(home.join("config.toml"), foreign_config).unwrap();
+        std::fs::write(home.join("auth.json"), foreign_auth).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-uapi-owned-0123456789")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+
+        let error =
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("其他供应商"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            foreign_config
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), foreign_auth);
+        assert_eq!(
+            store.load().unwrap().active_relay_id,
+            distribution::FIXED_PROVIDER_ID
+        );
+    }
+
+    #[test]
+    fn switching_to_official_strips_owned_key_and_keeps_newest_live_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let owned_key = "test-owned-mixed-key-012345";
+        write_live_uapi(&home, &profile, owned_key);
+        let mixed = serde_json::to_string_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": owned_key,
+            "tokens": {
+                "access_token": "fresh-mixed-live-token",
+                "refresh_token": "fresh-mixed-live-refresh"
+            },
+            "keep": true
+        }))
+        .unwrap();
+        std::fs::write(home.join("auth.json"), mixed).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+        vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                &official_auth_json_with_access_token("stale-vault-token"),
+            )
+            .unwrap();
+
+        switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official).unwrap();
+
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        let stored: Value = serde_json::from_str(
+            &vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(live.get("OPENAI_API_KEY").is_none());
+        assert_eq!(live["tokens"]["access_token"], "fresh-mixed-live-token");
+        assert_eq!(live["keep"], true);
+        assert_eq!(stored, live);
+        assert_eq!(store.load().unwrap().active_relay_id, OFFICIAL_RELAY_ID);
+    }
+
+    #[test]
+    fn switching_to_official_recovers_tokens_from_a_legacy_polluted_vault_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let owned_key = "test-upgrade-owned-key-012345";
+        write_live_uapi(&home, &profile, owned_key);
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+        vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                &serde_json::to_string_pretty(&json!({
+                    "auth_mode": "chatgpt",
+                    "OPENAI_API_KEY": "legacy-polluted-key-must-not-return",
+                    "tokens": {
+                        "access_token": "legacy-snapshot-access-token",
+                        "refresh_token": "legacy-snapshot-refresh-token"
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official).unwrap();
+
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        let stored: Value = serde_json::from_str(
+            &vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(live.get("OPENAI_API_KEY").is_none());
+        assert!(stored.get("OPENAI_API_KEY").is_none());
+        assert_eq!(
+            live["tokens"]["access_token"],
+            "legacy-snapshot-access-token"
+        );
+        assert_eq!(stored, live);
+    }
+
+    #[test]
+    fn switching_to_official_rejects_foreign_key_mixed_with_official_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let owned_key = "test-owned-mixed-key-012345";
+        write_live_uapi(&home, &profile, owned_key);
+        let mixed_foreign = serde_json::to_vec_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": "test-foreign-mixed-key-987654",
+            "tokens": {
+                "access_token": "foreign-mixed-live-token",
+                "refresh_token": "foreign-mixed-live-refresh"
+            }
+        }))
+        .unwrap();
+        std::fs::write(home.join("auth.json"), &mixed_foreign).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+        let saved = official_auth_json_with_access_token("safe-vault-token");
+        vault.set(CredentialSlot::OfficialAuthJson, &saved).unwrap();
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+
+        let error =
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("无法确认归属"));
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            mixed_foreign
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn switching_to_official_rejects_foreign_auth_and_rolls_back_live_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-uapi-owned-0123456789")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-uapi-owned-0123456789");
+        let foreign_auth =
+            b"{\n  \"OPENAI_API_KEY\": \"sk-foreign-new-9876543210\",\n  \"keep\": true\n}\n";
+        std::fs::write(home.join("auth.json"), foreign_auth).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+
+        let error =
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("无法确认归属"));
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), foreign_auth);
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            store.load().unwrap().active_relay_id,
+            distribution::FIXED_PROVIDER_ID
+        );
+    }
+
+    #[test]
+    fn switching_to_official_rejects_damaged_config_and_rolls_back_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let damaged_config = b"model_provider = [not valid toml\n";
+        let auth = b"{}\n";
+        std::fs::write(home.join("config.toml"), damaged_config).unwrap();
+        std::fs::write(home.join("auth.json"), auth).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+
+        let error =
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("config.toml 已损坏"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            damaged_config
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth);
+        assert_eq!(
+            store.load().unwrap().active_relay_id,
+            distribution::FIXED_PROVIDER_ID
+        );
+    }
+
+    #[test]
+    fn switching_to_official_rejects_an_unowned_openai_transport_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let foreign_config = b"model = \"gpt-5\"\nmodel_provider = \"openai\"\nopenai_base_url = \"https://foreign.example/v1\"\n";
+        std::fs::write(home.join("config.toml"), foreign_config).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+
+        let error =
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("官方传输覆盖"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            foreign_config
+        );
+        assert!(!home.join("auth.json").exists());
+        assert_eq!(
+            store.load().unwrap().active_relay_id,
+            distribution::FIXED_PROVIDER_ID
+        );
+    }
+
+    #[test]
+    fn switching_to_official_fails_closed_when_uapi_key_ownership_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-uapi-owned-0123456789")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+        write_live_uapi(&home, &profile, "sk-uapi-owned-0123456789");
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        vault.fail_get(CredentialSlot::UapiApiKey);
+
+        let error =
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("无法确认归属"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            store.load().unwrap().active_relay_id,
+            distribution::FIXED_PROVIDER_ID
+        );
     }
 
     #[test]
@@ -4072,19 +6093,23 @@ mod tests {
         let catalog_path = managed_catalog_path(home);
         std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
         std::fs::create_dir(&catalog_path).unwrap();
+        std::fs::create_dir(refresh_request_marker_path(home)).unwrap();
         let snapshot = UapiLiveFilesSnapshot {
             config: Some(b"old config".to_vec()),
             auth: Some(b"old auth".to_vec()),
             managed_catalog: Some(b"old catalog".to_vec()),
+            refresh_request_marker: Some(b"old refresh marker".to_vec()),
         };
 
         let error = snapshot.restore(home).unwrap_err().to_string();
         assert!(error.contains("config.toml="));
         assert!(error.contains("auth.json="));
         assert!(error.contains("model catalog="));
+        assert!(error.contains("refresh marker="));
         assert!(!error.contains("config.toml=ok"));
         assert!(!error.contains("auth.json=ok"));
         assert!(!error.contains("model catalog=ok"));
+        assert!(!error.contains("refresh marker=ok"));
     }
 
     #[test]
@@ -4168,6 +6193,11 @@ mod tests {
         live_config["model_providers"]["user_custom"]["base_url"] =
             toml_edit::value("https://user.example/v1");
         std::fs::write(home.join("config.toml"), live_config.to_string()).unwrap();
+        std::fs::write(
+            refresh_request_marker_path(&home),
+            "refresh-before-uninstall",
+        )
+        .unwrap();
         let vault = MemoryCredentialVault::default();
         let official_auth = official_auth_json();
         vault
@@ -4189,6 +6219,7 @@ mod tests {
             official_auth
         );
         assert!(!managed_catalog_path(&home).exists());
+        assert!(!refresh_request_marker_path(&home).exists());
         assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
         assert!(
             vault
@@ -4298,6 +6329,66 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_cleanup_rejects_foreign_key_mixed_with_official_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let owned_key = "test-uninstall-owned-key-012345";
+        write_live_uapi(&home, &managed, owned_key);
+        let mixed_foreign = serde_json::to_vec_pretty(&json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": "test-uninstall-foreign-key-987654",
+            "tokens": {
+                "access_token": "foreign-uninstall-live-token",
+                "refresh_token": "foreign-uninstall-live-refresh"
+            }
+        }))
+        .unwrap();
+        std::fs::write(home.join("auth.json"), &mixed_foreign).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+        let official = official_auth_json();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official)
+            .unwrap();
+        let settings_before = std::fs::read(&isolated_path).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+        let error =
+            uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("无法确认归属"));
+        assert_eq!(std::fs::read(&isolated_path).unwrap(), settings_before);
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            mixed_foreign
+        );
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some(owned_key)
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::OfficialAuthJson).unwrap(),
+            Some(official)
+        );
+    }
+
+    #[test]
     fn uninstall_cleanup_recognizes_keys_from_every_duplicate_owned_profile() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -4384,6 +6475,59 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_cleanup_strips_owned_key_and_preserves_live_official_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let owned_key = "test-uninstall-mixed-key-012345";
+        write_live_uapi(&home, &managed, owned_key);
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": owned_key,
+                "tokens": {
+                    "access_token": "fresh-uninstall-live-token",
+                    "refresh_token": "fresh-uninstall-live-refresh"
+                },
+                "keep": "preserved"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.set(CredentialSlot::UapiApiKey, owned_key).unwrap();
+        vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                &official_auth_json_with_access_token("stale-uninstall-vault-token"),
+            )
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        let live: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        assert!(live.get("OPENAI_API_KEY").is_none());
+        assert_eq!(live["tokens"]["access_token"], "fresh-uninstall-live-token");
+        assert_eq!(live["keep"], "preserved");
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+        assert!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn uninstall_cleanup_preserves_newer_live_official_auth() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -4448,6 +6592,8 @@ mod tests {
             .set(CredentialSlot::OfficialAuthJson, &official_auth)
             .unwrap();
         vault.fail_delete(CredentialSlot::OfficialAuthJson);
+        let refresh_marker_before = b"refresh-before-uninstall";
+        std::fs::write(refresh_request_marker_path(&home), refresh_marker_before).unwrap();
         let isolated_before = std::fs::read(&isolated_path).unwrap();
         let legacy_before = std::fs::read(&legacy_path).unwrap();
         let config_before = std::fs::read(home.join("config.toml")).unwrap();
@@ -4468,6 +6614,10 @@ mod tests {
         assert_eq!(
             std::fs::read(managed_catalog_path(&home)).unwrap(),
             catalog_before
+        );
+        assert_eq!(
+            std::fs::read(refresh_request_marker_path(&home)).unwrap(),
+            refresh_marker_before
         );
         assert_eq!(
             vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),

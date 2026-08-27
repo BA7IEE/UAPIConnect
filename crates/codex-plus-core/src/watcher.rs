@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use anyhow::Context;
+
 #[cfg(windows)]
 pub use crate::windows_integration::WindowsProcessInfo;
 
@@ -24,6 +26,20 @@ pub struct WatcherInstallPlan {
     pub shortcut_name: String,
     pub shortcut_target: String,
     pub shortcut_arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LauncherProcessInfo {
+    pub process_id: u32,
+    pub parent_process_id: u32,
+    pub executable_name: String,
+    pub executable_path: Option<PathBuf>,
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+struct OwnedLauncherSelection {
+    expected_launcher_path: PathBuf,
+    process_ids: Vec<u32>,
 }
 
 pub fn watcher_disabled_flag(root: &Path) -> PathBuf {
@@ -115,27 +131,117 @@ fn is_windowsapps_codex_app_process(executable: &str) -> bool {
             .is_some_and(crate::app_paths::is_supported_app_executable_name)
 }
 
-pub fn filter_killable_launcher_processes<'a>(
-    processes: impl IntoIterator<Item = (u32, u32, &'a str)>,
+pub fn filter_owned_launcher_processes(
+    processes: &[LauncherProcessInfo],
     current_process_id: u32,
-) -> Vec<u32> {
-    let processes = processes.into_iter().collect::<Vec<_>>();
+    expected_launcher_path: &Path,
+) -> anyhow::Result<Vec<u32>> {
+    let expected_launcher_path = canonical_launcher_path(expected_launcher_path)?;
     let parents = processes
         .iter()
-        .map(|(process_id, parent_process_id, _)| (*process_id, *parent_process_id))
+        .map(|process| (process.process_id, process.parent_process_id))
         .collect::<HashMap<_, _>>();
     let mut protected = HashSet::new();
     let mut cursor = current_process_id;
     while cursor != 0 && protected.insert(cursor) {
         cursor = parents.get(&cursor).copied().unwrap_or(0);
     }
-    processes
-        .into_iter()
-        .filter(|(process_id, _, exe_file)| {
-            !protected.contains(process_id) && exe_file.eq_ignore_ascii_case("codex-plus-plus.exe")
-        })
-        .map(|(process_id, _, _)| process_id)
-        .collect()
+    let mut owned = Vec::new();
+    for process in processes {
+        if protected.contains(&process.process_id) {
+            continue;
+        }
+        if launcher_process_matches_owned_path(process, &expected_launcher_path)? {
+            owned.push(process.process_id);
+        }
+    }
+    Ok(owned)
+}
+
+pub fn terminate_revalidated_launcher_processes<Inspect, Terminate>(
+    process_ids: &[u32],
+    expected_launcher_path: &Path,
+    mut inspect: Inspect,
+    mut terminate: Terminate,
+) -> anyhow::Result<()>
+where
+    Inspect: FnMut(u32) -> anyhow::Result<Option<LauncherProcessInfo>>,
+    Terminate: FnMut(u32) -> anyhow::Result<()>,
+{
+    let expected_launcher_path = canonical_launcher_path(expected_launcher_path)?;
+    for process_id in process_ids {
+        let Some(process) = inspect(*process_id)
+            .with_context(|| format!("终止前无法重新确认 launcher 进程 {process_id}"))?
+        else {
+            // 首次枚举后自行退出，不需要再执行 kill。
+            continue;
+        };
+        if process.process_id != *process_id
+            || !launcher_process_matches_owned_path(&process, &expected_launcher_path)?
+        {
+            anyhow::bail!(
+                "launcher 进程 {process_id} 的身份已变化，不再属于当前发行版，已拒绝终止"
+            );
+        }
+        terminate(*process_id)
+            .with_context(|| format!("无法停止当前发行版 launcher 进程 {process_id}"))?;
+    }
+    Ok(())
+}
+
+fn launcher_process_matches_owned_path(
+    process: &LauncherProcessInfo,
+    expected_launcher_path: &Path,
+) -> anyhow::Result<bool> {
+    let expected_name = expected_launcher_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("当前发行版启动器路径缺少有效文件名")?;
+    if !launcher_executable_names_equal(&process.executable_name, expected_name) {
+        return Ok(false);
+    }
+    let executable_path = process.executable_path.as_deref().with_context(|| {
+        format!(
+            "无法确认同名启动器进程 {} 的可执行路径，已停止操作",
+            process.process_id
+        )
+    })?;
+    let executable_path = canonical_launcher_path(executable_path).with_context(|| {
+        format!(
+            "无法规范化同名启动器进程 {} 的可执行路径，已停止操作",
+            process.process_id
+        )
+    })?;
+    Ok(launcher_paths_equal(
+        &executable_path,
+        expected_launcher_path,
+    ))
+}
+
+fn canonical_launcher_path(path: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::canonicalize(path)
+        .with_context(|| format!("无法确认启动器可执行文件 {}", path.to_string_lossy()))
+}
+
+#[cfg(windows)]
+fn launcher_executable_names_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn launcher_executable_names_equal(left: &str, right: &str) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn launcher_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn launcher_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
 }
 
 pub fn should_recover_stale_launcher(has_codex_process: bool, cdp_listening: bool) -> bool {
@@ -231,12 +337,12 @@ pub fn install_watcher(_launcher_path: &Path, _debug_port: u16) -> anyhow::Resul
 
 #[cfg(windows)]
 pub fn uninstall_watcher() -> anyhow::Result<()> {
+    stop_launcher_processes_and_wait()?;
     let _ =
         crate::windows_integration::delete_current_user_value(WATCHER_RUN_KEY, WATCHER_RUN_NAME);
     if let Some(shortcut) = startup_shortcut_path() {
         let _ = std::fs::remove_file(shortcut);
     }
-    stop_launcher_processes();
     Ok(())
 }
 
@@ -354,65 +460,48 @@ pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
 }
 
 #[cfg(windows)]
-pub fn stop_launcher_processes() {
-    let processes = crate::windows_integration::enumerate_processes();
-    let killable = filter_killable_launcher_processes(
-        processes.iter().map(|process| {
-            (
-                process.process_id,
-                process.parent_process_id,
-                process.exe_file.as_str(),
-            )
-        }),
-        std::process::id(),
-    );
-    for process_id in killable {
-        let _ = crate::windows_integration::terminate_process(process_id);
-    }
+pub fn stop_launcher_processes() -> anyhow::Result<()> {
+    let killable = find_owned_launcher_processes()?;
+    terminate_windows_launcher_processes(&killable)
 }
 
 #[cfg(target_os = "macos")]
-pub fn stop_launcher_processes() {
-    for process_id in find_launcher_processes() {
-        let _ = terminate_macos_process(process_id);
-    }
+pub fn stop_launcher_processes() -> anyhow::Result<()> {
+    let killable = find_owned_launcher_processes()?;
+    terminate_macos_launcher_processes(&killable)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn stop_launcher_processes() {}
+pub fn stop_launcher_processes() -> anyhow::Result<()> {
+    Ok(())
+}
 
 #[cfg(windows)]
-pub fn stop_launcher_processes_and_wait() {
-    let processes = crate::windows_integration::enumerate_processes();
-    let killable = filter_killable_launcher_processes(
-        processes.iter().map(|process| {
-            (
-                process.process_id,
-                process.parent_process_id,
-                process.exe_file.as_str(),
-            )
-        }),
-        std::process::id(),
-    );
-    terminate_and_wait_for_exit(
-        killable,
+pub fn stop_launcher_processes_and_wait() -> anyhow::Result<()> {
+    let killable = find_owned_launcher_processes()?;
+    terminate_windows_launcher_processes(&killable)?;
+    wait_for_windows_process_exit(
+        &killable.process_ids,
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
-    );
+    )
 }
 
 #[cfg(target_os = "macos")]
-pub fn stop_launcher_processes_and_wait() {
-    terminate_macos_processes_and_wait(
-        find_launcher_processes(),
-        || find_launcher_processes(),
+pub fn stop_launcher_processes_and_wait() -> anyhow::Result<()> {
+    let killable = find_owned_launcher_processes()?;
+    terminate_macos_launcher_processes(&killable)?;
+    wait_for_macos_process_exit(
+        &killable.process_ids,
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
-    );
+    )
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn stop_launcher_processes_and_wait() {}
+pub fn stop_launcher_processes_and_wait() -> anyhow::Result<()> {
+    Ok(())
+}
 
 #[cfg(windows)]
 pub fn stop_codex_processes() {
@@ -505,28 +594,260 @@ fn terminate_macos_processes_and_wait<F>(
 
 #[cfg(target_os = "macos")]
 fn terminate_macos_process(process_id: u32) -> std::io::Result<()> {
-    Command::new("kill")
+    let status = Command::new("kill")
         .arg(process_id.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map(|_| ())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "kill exited with status {status} for process {process_id}"
+        )))
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn current_companion_launcher_path() -> anyhow::Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("无法确认当前程序的可执行路径")?;
+    let launcher =
+        crate::install::companion_binary_path_from_exe(&current_exe, crate::install::SILENT_BINARY);
+    canonical_launcher_path(&launcher).with_context(|| {
+        format!(
+            "无法确认当前发行版 companion launcher {}",
+            launcher.to_string_lossy()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn find_owned_launcher_processes() -> anyhow::Result<OwnedLauncherSelection> {
+    let expected_launcher_path = current_companion_launcher_path()?;
+    let processes = crate::windows_integration::enumerate_processes();
+    let current_process_id = std::process::id();
+    if !processes
+        .iter()
+        .any(|process| process.process_id == current_process_id)
+    {
+        anyhow::bail!("无法读取完整的 Windows 进程列表，已停止 launcher 操作");
+    }
+    let processes = processes
+        .into_iter()
+        .map(|process| LauncherProcessInfo {
+            process_id: process.process_id,
+            parent_process_id: process.parent_process_id,
+            executable_name: process.exe_file,
+            executable_path: process.executable_path,
+        })
+        .collect::<Vec<_>>();
+    let process_ids =
+        filter_owned_launcher_processes(&processes, current_process_id, &expected_launcher_path)?;
+    Ok(OwnedLauncherSelection {
+        expected_launcher_path,
+        process_ids,
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn find_launcher_processes() -> Vec<u32> {
-    std::process::Command::new("pgrep")
-        .args(["-x", crate::install::SILENT_BINARY])
+fn find_owned_launcher_processes() -> anyhow::Result<OwnedLauncherSelection> {
+    let expected_launcher_path = current_companion_launcher_path()?;
+    let processes = enumerate_macos_processes()?;
+    let current_process_id = std::process::id();
+    if !processes
+        .iter()
+        .any(|process| process.process_id == current_process_id)
+    {
+        anyhow::bail!("无法读取完整的 macOS 进程列表，已停止 launcher 操作");
+    }
+    let process_ids =
+        filter_owned_launcher_processes(&processes, current_process_id, &expected_launcher_path)?;
+    Ok(OwnedLauncherSelection {
+        expected_launcher_path,
+        process_ids,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn enumerate_macos_processes() -> anyhow::Result<Vec<LauncherProcessInfo>> {
+    let output = Command::new("ps")
+        .args(["-axww", "-o", "pid=,ppid=,comm="])
         .output()
-        .ok()
-        .into_iter()
-        .flat_map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|value| value.trim().parse::<u32>().ok())
-                .collect::<Vec<_>>()
-        })
+        .context("无法读取 macOS 进程列表")?;
+    if !output.status.success() {
+        anyhow::bail!("ps 无法读取 macOS 进程列表：{}", output.status);
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(parse_macos_process_line)
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_process_line(line: &str) -> anyhow::Result<LauncherProcessInfo> {
+    let (process_id, rest) = take_process_field(line).context("macOS 进程行缺少 PID")?;
+    let (parent_process_id, executable_path) =
+        take_process_field(rest).context("macOS 进程行缺少 PPID")?;
+    let executable_path = executable_path.trim();
+    if executable_path.is_empty() {
+        anyhow::bail!("macOS 进程行缺少可执行路径");
+    }
+    let executable_path = PathBuf::from(executable_path);
+    let executable_name = executable_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("macOS 进程行包含无效可执行文件名")?
+        .to_string();
+    Ok(LauncherProcessInfo {
+        process_id: process_id.parse().context("macOS 进程 PID 无效")?,
+        parent_process_id: parent_process_id.parse().context("macOS 进程 PPID 无效")?,
+        executable_name,
+        executable_path: Some(executable_path),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn take_process_field(value: &str) -> Option<(&str, &str)> {
+    let value = value.trim_start();
+    let end = value.find(char::is_whitespace)?;
+    Some((&value[..end], value[end..].trim_start()))
+}
+
+#[cfg(windows)]
+fn inspect_windows_launcher_process(
+    process_id: u32,
+) -> anyhow::Result<Option<LauncherProcessInfo>> {
+    let processes = crate::windows_integration::enumerate_processes();
+    if !processes
+        .iter()
+        .any(|process| process.process_id == std::process::id())
+    {
+        anyhow::bail!("终止前无法读取完整的 Windows 进程列表");
+    }
+    Ok(processes
+        .into_iter()
+        .find(|process| process.process_id == process_id)
+        .map(|process| LauncherProcessInfo {
+            process_id: process.process_id,
+            parent_process_id: process.parent_process_id,
+            executable_name: process.exe_file,
+            executable_path: process.executable_path,
+        }))
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_macos_launcher_process(process_id: u32) -> anyhow::Result<Option<LauncherProcessInfo>> {
+    let processes = enumerate_macos_processes()?;
+    if !processes
+        .iter()
+        .any(|process| process.process_id == std::process::id())
+    {
+        anyhow::bail!("终止前无法读取完整的 macOS 进程列表");
+    }
+    Ok(processes
+        .into_iter()
+        .find(|process| process.process_id == process_id))
+}
+
+#[cfg(windows)]
+fn terminate_windows_launcher_processes(selection: &OwnedLauncherSelection) -> anyhow::Result<()> {
+    terminate_revalidated_launcher_processes(
+        &selection.process_ids,
+        &selection.expected_launcher_path,
+        inspect_windows_launcher_process,
+        |process_id| {
+            if !crate::windows_integration::terminate_process(process_id)
+                && process_id_is_running(process_id) != Some(false)
+            {
+                anyhow::bail!("Windows 拒绝终止进程");
+            }
+            Ok(())
+        },
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_macos_launcher_processes(selection: &OwnedLauncherSelection) -> anyhow::Result<()> {
+    terminate_revalidated_launcher_processes(
+        &selection.process_ids,
+        &selection.expected_launcher_path,
+        inspect_macos_launcher_process,
+        |process_id| match terminate_macos_process(process_id) {
+            Ok(()) => Ok(()),
+            Err(_) if process_id_is_running(process_id) == Some(false) => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    )
+}
+
+#[cfg(windows)]
+fn wait_for_windows_process_exit(
+    process_ids: &[u32],
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let processes = crate::windows_integration::enumerate_processes();
+        if !processes
+            .iter()
+            .any(|process| process.process_id == std::process::id())
+        {
+            anyhow::bail!("等待 launcher 退出时无法读取完整的 Windows 进程列表");
+        }
+        let remaining = process_ids_still_running(
+            process_ids,
+            processes.into_iter().map(|process| process.process_id),
+        );
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            log_launcher_stop_timeout(&remaining, timeout_ms, "windows");
+            anyhow::bail!("等待当前发行版 launcher 退出超时，仍在运行：{remaining:?}");
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_macos_process_exit(
+    process_ids: &[u32],
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let mut remaining = Vec::new();
+        for process_id in process_ids {
+            match process_id_is_running(*process_id) {
+                Some(true) => remaining.push(*process_id),
+                Some(false) => {}
+                None => anyhow::bail!("等待 launcher 退出时无法确认进程 {process_id} 的状态"),
+            }
+        }
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            log_launcher_stop_timeout(&remaining, timeout_ms, "macos");
+            anyhow::bail!("等待当前发行版 launcher 退出超时，仍在运行：{remaining:?}");
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn log_launcher_stop_timeout(remaining: &[u32], timeout_ms: u64, platform: &str) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "watcher.stop_wait_timeout",
+        serde_json::json!({
+            "remaining_process_ids": remaining,
+            "timeout_ms": timeout_ms,
+            "platform": platform
+        }),
+    );
 }
 
 #[cfg(target_os = "macos")]

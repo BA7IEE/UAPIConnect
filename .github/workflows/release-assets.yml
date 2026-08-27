@@ -82,8 +82,28 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install NSIS
-        run: choco install nsis -y
+      - name: Install pinned NSIS
+        shell: pwsh
+        run: |
+          choco install nsis `
+            --version=3.12.0 `
+            --allow-downgrade `
+            --source=https://community.chocolatey.org/api/v2/ `
+            --yes `
+            --no-progress
+          $chocoExitCode = $LASTEXITCODE
+          if (@(0, 1641, 3010) -notcontains $chocoExitCode) {
+            throw "Chocolatey failed to install NSIS 3.12.0 (exit $chocoExitCode)"
+          }
+
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path -LiteralPath $makensis)) {
+            throw "Pinned makensis was not installed at $makensis"
+          }
+          $compilerVersion = (& $makensis /VERSION 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $compilerVersion -ne "v3.12") {
+            throw "Expected makensis v3.12, got '$compilerVersion'"
+          }
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -263,7 +283,13 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}" -replace '^[vV]', ''
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $makensis)) { $makensis = "makensis" }
+          if (-not (Test-Path -LiteralPath $makensis)) {
+            throw "Pinned makensis is missing at $makensis"
+          }
+          $compilerVersion = (& $makensis /VERSION 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $compilerVersion -ne "v3.12") {
+            throw "Expected pinned makensis v3.12 before compilation, got '$compilerVersion'"
+          }
           $makensisArguments = @(
             "/INPUTCHARSET",
             "UTF8",

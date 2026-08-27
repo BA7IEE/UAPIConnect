@@ -5,11 +5,11 @@ use super::{
     install_root_or_default, option_or_current_exe,
 };
 
+#[cfg(windows)]
 const UNINSTALL_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect";
-const LEGACY_UNINSTALL_SUBKEY: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Codex++";
+#[cfg(windows)]
 const URL_PROTOCOL_SUBKEY: &str = r"Software\Classes\uapiconnect";
-const DREAM_SKIN_URL_PROTOCOL_SUBKEY: &str = r"Software\Classes\dreamskin";
+const QUIET_UNINSTALL_BOOTSTRAPPER: &str = "quiet-uninstall-bootstrap.ps1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsEntrypointPlan {
@@ -22,10 +22,11 @@ pub struct WindowsEntrypointPlan {
     pub silent_icon_path: String,
     pub manager_icon_path: String,
     pub uninstaller_path: String,
+    pub quiet_uninstall_bootstrapper_path: String,
     pub uninstall_command: String,
     pub quiet_uninstall_command: String,
     pub uninstall_key: String,
-    pub legacy_uninstall_key: String,
+    pub url_protocol_key: String,
     pub remove_owned_data: bool,
 }
 
@@ -39,8 +40,10 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypo
         .map(Path::to_path_buf)
         .unwrap_or_else(|| install_root.clone());
     let uninstaller_path = install_location.join("uninstall.exe");
+    let quiet_uninstall_bootstrapper_path = install_location.join(QUIET_UNINSTALL_BOOTSTRAPPER);
     let uninstall_command = format!("\"{}\"", uninstaller_path.to_string_lossy());
-    let quiet_uninstall_command = format!("{uninstall_command} /S");
+    let quiet_uninstall_command =
+        quiet_uninstall_command(&quiet_uninstall_bootstrapper_path, &install_location);
     WindowsEntrypointPlan {
         silent_shortcut: install_root
             .join("U-API Connect.lnk")
@@ -57,10 +60,13 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypo
         silent_icon_path: launcher_path.to_string_lossy().to_string(),
         manager_icon_path: manager_path.to_string_lossy().to_string(),
         uninstaller_path: uninstaller_path.to_string_lossy().to_string(),
+        quiet_uninstall_bootstrapper_path: quiet_uninstall_bootstrapper_path
+            .to_string_lossy()
+            .to_string(),
         uninstall_command,
         quiet_uninstall_command,
         uninstall_key: "UAPIConnect".to_string(),
-        legacy_uninstall_key: "Codex++".to_string(),
+        url_protocol_key: "uapiconnect".to_string(),
         remove_owned_data: options.remove_owned_data,
     }
 }
@@ -102,17 +108,6 @@ pub fn uninstall_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
         r"{URL_PROTOCOL_SUBKEY}\shell"
     ));
     let _ = crate::windows_integration::delete_current_user_key(URL_PROTOCOL_SUBKEY);
-    let _ = crate::windows_integration::delete_current_user_key(&format!(
-        r"{DREAM_SKIN_URL_PROTOCOL_SUBKEY}\shell\open\command"
-    ));
-    let _ = crate::windows_integration::delete_current_user_key(&format!(
-        r"{DREAM_SKIN_URL_PROTOCOL_SUBKEY}\shell\open"
-    ));
-    let _ = crate::windows_integration::delete_current_user_key(&format!(
-        r"{DREAM_SKIN_URL_PROTOCOL_SUBKEY}\shell"
-    ));
-    let _ = crate::windows_integration::delete_current_user_key(DREAM_SKIN_URL_PROTOCOL_SUBKEY);
-    let _ = crate::windows_integration::delete_current_user_key(LEGACY_UNINSTALL_SUBKEY);
     let _ = crate::windows_integration::delete_current_user_key(UNINSTALL_SUBKEY);
     Ok(())
 }
@@ -147,25 +142,50 @@ fn create_entrypoint_shortcut(
 
 #[cfg(windows)]
 fn write_uninstall_registration(plan: &WindowsEntrypointPlan) -> anyhow::Result<()> {
-    let _ = crate::windows_integration::delete_current_user_key(LEGACY_UNINSTALL_SUBKEY);
+    for (name, value) in windows_uninstall_registration_values(plan) {
+        crate::windows_integration::set_current_user_string_value(UNINSTALL_SUBKEY, name, &value)?;
+    }
+    Ok(())
+}
+
+pub fn windows_uninstall_registration_values(
+    plan: &WindowsEntrypointPlan,
+) -> Vec<(&'static str, String)> {
     let install_location = Path::new(&plan.manager_path)
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(&plan.install_root))
         .to_string_lossy()
         .to_string();
-    for (name, value) in [
+    let mut values = vec![
         ("DisplayName", crate::distribution::PRODUCT_NAME.to_string()),
         ("DisplayVersion", crate::version::VERSION.to_string()),
         ("Publisher", crate::distribution::PUBLISHER.to_string()),
         ("DisplayIcon", plan.manager_icon_path.clone()),
         ("InstallLocation", install_location),
         ("UninstallString", plan.uninstall_command.clone()),
-        ("QuietUninstallString", plan.quiet_uninstall_command.clone()),
-    ] {
-        crate::windows_integration::set_current_user_string_value(UNINSTALL_SUBKEY, name, &value)?;
+    ];
+    // 老安装没有这个脚本。修复入口只能在安装器已部署 bootstrap 后升级
+    // QuietUninstallString，否则会把仍可用的旧卸载命令改成悬空路径。
+    if Path::new(&plan.quiet_uninstall_bootstrapper_path).is_file() {
+        values.push(("QuietUninstallString", plan.quiet_uninstall_command.clone()));
     }
-    Ok(())
+    values
+}
+
+fn quiet_uninstall_command(bootstrapper_path: &Path, install_location: &Path) -> String {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let system_root = system_root.trim_end_matches(['\\', '/']).replace('/', "\\");
+    let powershell = format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+    let bootstrapper_path = windows_command_path(bootstrapper_path);
+    let install_location = windows_command_path(install_location);
+    format!(
+        "\"{powershell}\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{bootstrapper_path}\" -InstallDir \"{install_location}\""
+    )
+}
+
+fn windows_command_path(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\")
 }
 
 #[cfg(windows)]

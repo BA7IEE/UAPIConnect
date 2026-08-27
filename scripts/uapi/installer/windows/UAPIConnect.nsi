@@ -99,13 +99,30 @@ webview2_done:
 SectionEnd
 
 Section "Install"
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File /oname=stop-owned-processes.ps1 "${ROOT}\scripts\uapi\installer\windows\stop-owned-processes.ps1"
+  DetailPrint "正在停止此安装目录中的 U-API Connect 进程..."
+  ClearErrors
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-owned-processes.ps1" -InstallDir "$INSTDIR"' $0
+  IfErrors install_stop_failed
+  StrCmp $0 "0" install_processes_stopped install_stop_failed
+
+install_stop_failed:
+  Delete "$PLUGINSDIR\stop-owned-processes.ps1"
+  DetailPrint "无法安全停止此安装目录中的 U-API Connect 进程，尚未写入程序文件。"
+  SetErrorLevel 2
+  IfSilent install_stop_aborted
+  MessageBox MB_ICONSTOP|MB_OK "无法安全停止当前安装目录中的 U-API Connect。安装已中止，其他目录中的同名程序不会受到影响。请关闭本目录中的 U-API Connect 后重试。"
+install_stop_aborted:
+  Abort
+
+install_processes_stopped:
+  Delete "$PLUGINSDIR\stop-owned-processes.ps1"
   SetOutPath "$INSTDIR"
-  nsExec::ExecToLog 'taskkill /IM codex-plus-plus.exe /F'
-  Pop $0
-  nsExec::ExecToLog 'taskkill /IM codex-plus-plus-manager.exe /F'
-  Pop $0
   File "${ROOT}\dist\uapi\windows\app\codex-plus-plus.exe"
   File "${ROOT}\dist\uapi\windows\app\codex-plus-plus-manager.exe"
+  File /oname=quiet-uninstall-bootstrap.ps1 "${ROOT}\scripts\uapi\installer\windows\quiet-uninstall-bootstrap.ps1"
   CreateShortcut "$DESKTOP\U-API Connect.lnk" "$INSTDIR\codex-plus-plus.exe" "" "$INSTDIR\codex-plus-plus.exe"
   CreateShortcut "$DESKTOP\U-API Connect 设置.lnk" "$INSTDIR\codex-plus-plus-manager.exe" "" "$INSTDIR\codex-plus-plus-manager.exe"
   CreateDirectory "$SMPROGRAMS\U-API Connect"
@@ -120,17 +137,36 @@ Section "Install"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "DisplayIcon" "$INSTDIR\codex-plus-plus-manager.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "UninstallString" '"$INSTDIR\uninstall.exe"'
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
+  ; A normal NSIS uninstaller self-copies, so its real SetErrorLevel value is
+  ; hidden from the registered command's caller. The bootstrap copies it first,
+  ; invokes that copy with _?=$INSTDIR, waits, and returns the real exit code.
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\UAPIConnect" "QuietUninstallString" '"$WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "$INSTDIR\quiet-uninstall-bootstrap.ps1" -InstallDir "$INSTDIR"'
   WriteRegStr HKCU "Software\Classes\uapiconnect" "" "URL:U-API Connect Protocol"
   WriteRegStr HKCU "Software\Classes\uapiconnect" "URL Protocol" ""
   WriteRegStr HKCU "Software\Classes\uapiconnect\shell\open\command" "" '"$INSTDIR\codex-plus-plus-manager.exe" "%1"'
 SectionEnd
 
 Section "Uninstall"
-  nsExec::ExecToLog 'taskkill /IM codex-plus-plus.exe /F'
-  Pop $0
-  nsExec::ExecToLog 'taskkill /IM codex-plus-plus-manager.exe /F'
-  Pop $0
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File /oname=stop-owned-processes.ps1 "${ROOT}\scripts\uapi\installer\windows\stop-owned-processes.ps1"
+  DetailPrint "正在停止此安装目录中的 U-API Connect 进程..."
+  ClearErrors
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\stop-owned-processes.ps1" -InstallDir "$INSTDIR"' $0
+  IfErrors uninstall_stop_failed
+  StrCmp $0 "0" uninstall_processes_stopped uninstall_stop_failed
+
+uninstall_stop_failed:
+  Delete "$PLUGINSDIR\stop-owned-processes.ps1"
+  DetailPrint "无法安全停止此安装目录中的 U-API Connect 进程，已中止卸载。"
+  SetErrorLevel 2
+  IfSilent uninstall_stop_aborted
+  MessageBox MB_ICONSTOP|MB_OK "无法安全停止当前安装目录中的 U-API Connect。卸载已中止，程序文件仍然保留，其他目录中的同名程序不会受到影响。"
+uninstall_stop_aborted:
+  Abort
+
+uninstall_processes_stopped:
+  Delete "$PLUGINSDIR\stop-owned-processes.ps1"
   DetailPrint "正在解除 U-API Connect 对 Codex 的接管并清理自有凭据..."
   ClearErrors
   ExecWait '"$INSTDIR\codex-plus-plus-manager.exe" --uninstall-cleanup' $0
@@ -152,6 +188,7 @@ cleanup_succeeded:
   Delete "$SMPROGRAMS\U-API Connect\U-API Connect 设置.lnk"
   Delete "$SMPROGRAMS\U-API Connect\卸载 U-API Connect.lnk"
   RMDir "$SMPROGRAMS\U-API Connect"
+  Delete "$INSTDIR\quiet-uninstall-bootstrap.ps1"
   Delete "$INSTDIR\codex-plus-plus.exe"
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
   Delete "$INSTDIR\uninstall.exe"

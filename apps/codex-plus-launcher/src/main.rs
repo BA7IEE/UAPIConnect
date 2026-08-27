@@ -211,7 +211,8 @@ fn acquire_single_instance_guard_with_retry(
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
             log_launcher_already_running(debug_port);
             if allow_stale_recovery && should_recover_stale_launcher(debug_port) {
-                codex_plus_core::watcher::stop_launcher_processes();
+                codex_plus_core::watcher::stop_launcher_processes()
+                    .context("failed to stop the owned stale launcher")?;
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 return acquire_single_instance_guard_with_retry(debug_port, false);
             }

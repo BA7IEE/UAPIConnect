@@ -15,6 +15,7 @@ $installDir = Join-Path $env:LOCALAPPDATA "Programs\U-API Connect"
 $launcher = Join-Path $installDir "codex-plus-plus.exe"
 $manager = Join-Path $installDir "codex-plus-plus-manager.exe"
 $uninstaller = Join-Path $installDir "uninstall.exe"
+$quietUninstallBootstrap = Join-Path $installDir "quiet-uninstall-bootstrap.ps1"
 $desktop = [Environment]::GetFolderPath("Desktop")
 $programs = [Environment]::GetFolderPath("Programs")
 $desktopLauncher = Join-Path $desktop "U-API Connect.lnk"
@@ -32,6 +33,7 @@ $requiredPaths = @(
   $launcher,
   $manager,
   $uninstaller,
+  $quietUninstallBootstrap,
   $desktopLauncher,
   $desktopManager,
   $startMenuLauncher,
@@ -124,7 +126,10 @@ function Get-RegisteredUninstallCommands {
   $uninstallCommand = [string]$key.GetValue("UninstallString")
   $quietUninstallCommand = [string]$key.GetValue("QuietUninstallString")
   $expectedUninstallCommand = '"' + $uninstaller + '"'
-  $expectedQuietUninstallCommand = $expectedUninstallCommand + " /S"
+  $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $expectedQuietUninstallCommand = '"' + $windowsPowerShell +
+    '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' +
+    $quietUninstallBootstrap + '" -InstallDir "' + $installDir + '"'
 
   if ($uninstallCommand -ne $expectedUninstallCommand) {
     throw "Unexpected UninstallString: $uninstallCommand"
@@ -144,16 +149,52 @@ function Start-RegisteredCommand {
   $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
   $startInfo.FileName = $env:ComSpec
   $startInfo.UseShellExecute = $false
-  $startInfo.ArgumentList.Add("/d")
-  $startInfo.ArgumentList.Add("/s")
-  $startInfo.ArgumentList.Add("/c")
-  $startInfo.ArgumentList.Add($CommandLine)
+  # cmd.exe 的 /S /C 对首尾引号有自己的解析规则。ProcessStartInfo.ArgumentList
+  # 会再次转义注册表命令中的引号，最终把 \"C:\...\" 当成字面文件名。
+  # 用完整 Arguments 并额外包一层引号，等价于 Windows 卸载入口执行原始命令。
+  $startInfo.Arguments = '/d /s /c "' + $CommandLine + '"'
   $process = [System.Diagnostics.Process]::Start($startInfo)
   if ($null -eq $process) {
     throw "Failed to start registered command: $CommandLine"
   }
   $process.WaitForExit()
   return $process.ExitCode
+}
+
+function Assert-ForeignSameNameProcess {
+  param(
+    [Parameter(Mandatory = $true)]$Entry,
+    [Parameter(Mandatory = $true)][string]$Phase
+  )
+
+  if ($Entry.Process.HasExited) {
+    throw "$Phase stopped the foreign $($Entry.Name) process"
+  }
+  $cimProcess = @(
+    Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($Entry.Process.Id)"
+  ) | Select-Object -First 1
+  if ($null -eq $cimProcess) {
+    throw "Cannot query foreign $($Entry.Name) during $Phase"
+  }
+  if (([string]$cimProcess.Name) -ine $Entry.Name) {
+    throw "Foreign process fixture has WMI name '$($cimProcess.Name)', expected '$($Entry.Name)'"
+  }
+  $actualPath = [System.IO.Path]::GetFullPath([string]$cimProcess.ExecutablePath)
+  $expectedPath = [System.IO.Path]::GetFullPath([string]$Entry.Path)
+  if ($actualPath -ine $expectedPath) {
+    throw "Foreign $($Entry.Name) path changed during ${Phase}: $actualPath"
+  }
+}
+
+function Assert-ForeignSameNameProcesses {
+  param(
+    [Parameter(Mandatory = $true)][array]$Entries,
+    [Parameter(Mandatory = $true)][string]$Phase
+  )
+
+  foreach ($entry in $Entries) {
+    Assert-ForeignSameNameProcess -Entry $entry -Phase $Phase
+  }
 }
 
 $install = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
@@ -172,52 +213,150 @@ if ($protocolCommand -ne $expectedProtocolCommand) {
   throw "Unexpected protocol command: $protocolCommand"
 }
 
-$helper = Start-Process -FilePath $launcher -ArgumentList "--helper-only" -PassThru
-Start-Sleep -Seconds 2
-if ($helper.HasExited) {
-  throw "Installed launcher helper exited before upgrade"
-}
-$upgrade = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
-if ($upgrade.ExitCode -ne 0) {
-  throw "Upgrade exited with $($upgrade.ExitCode)"
-}
-if (-not $helper.WaitForExit(5000)) {
-  Stop-Process -Id $helper.Id -Force
-  throw "Upgrade did not stop the running launcher"
-}
+$foreignDir = Join-Path $env:RUNNER_TEMP "uapi-foreign-same-name-$PID"
+$pingExecutable = Join-Path $env:SystemRoot "System32\PING.EXE"
+$foreignEntries = @()
+$helper = $null
+$uninstallHelper = $null
 
-Assert-RequiredPaths
-Assert-ShortcutTargets
-Assert-AuthenticodeSignatures
-$registeredCommands = Get-RegisteredUninstallCommands
-
-$uninstallExitCode = Start-RegisteredCommand -CommandLine $registeredCommands.Quiet
-if ($uninstallExitCode -ne 0) {
-  throw "Registered uninstaller exited with $uninstallExitCode"
-}
-
-for ($attempt = 0; $attempt -lt 40; $attempt++) {
-  $remaining = @(
-    $installDir,
-    $launcher,
-    $manager,
-    $uninstaller,
-    $desktopLauncher,
-    $desktopManager,
-    $startMenuDir,
-    $startMenuLauncher,
-    $startMenuManager,
-    $startMenuUninstaller,
-    $productKey,
-    $uninstallKey,
-    $protocolRoot,
-    $protocolKey
-  ) | Where-Object { Test-Path -LiteralPath $_ }
-  if (-not $remaining) {
-    break
+try {
+  New-Item -ItemType Directory -Path $foreignDir -Force | Out-Null
+  foreach ($foreignName in @("codex-plus-plus.exe", "codex-plus-plus-manager.exe")) {
+    $foreignPath = Join-Path $foreignDir $foreignName
+    Copy-Item -LiteralPath $pingExecutable -Destination $foreignPath
+    $foreignEntries += [pscustomobject]@{
+      Name = $foreignName
+      Path = $foreignPath
+      Process = (Start-Process -FilePath $foreignPath -ArgumentList "-t 127.0.0.1" -PassThru)
+    }
   }
-  Start-Sleep -Milliseconds 500
-}
-if ($remaining) {
-  throw "Uninstaller left behind: $($remaining -join ', ')"
+
+  Start-Sleep -Seconds 2
+  Assert-ForeignSameNameProcesses -Entries $foreignEntries -Phase "before upgrade"
+
+  $helper = Start-Process -FilePath $launcher -ArgumentList "--helper-only" -PassThru
+  Start-Sleep -Seconds 2
+  if ($helper.HasExited) {
+    throw "Installed launcher helper exited before upgrade"
+  }
+  $upgrade = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -Wait -PassThru
+  if ($upgrade.ExitCode -ne 0) {
+    throw "Upgrade exited with $($upgrade.ExitCode)"
+  }
+  if (-not $helper.WaitForExit(5000)) {
+    Stop-Process -Id $helper.Id -Force
+    throw "Upgrade did not stop the running launcher"
+  }
+  Assert-ForeignSameNameProcesses -Entries $foreignEntries -Phase "after upgrade"
+
+  Assert-RequiredPaths
+  Assert-ShortcutTargets
+  Assert-AuthenticodeSignatures
+  $registeredCommands = Get-RegisteredUninstallCommands
+
+  # An exclusive handle makes CreateProcess fail for --uninstall-cleanup. This
+  # exercises the actual NSIS cleanup_failed -> SetErrorLevel 2 path: the copied
+  # uninstaller's status must reach the registered command, and no owned file or
+  # registration may be removed.
+  $managerLock = [System.IO.File]::Open(
+    $manager,
+    [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Read,
+    [System.IO.FileShare]::None
+  )
+  try {
+    $failedUninstallExitCode = Start-RegisteredCommand -CommandLine $registeredCommands.Quiet
+    if ($failedUninstallExitCode -ne 2) {
+      throw "Quiet uninstall bootstrap returned $failedUninstallExitCode for cleanup failure; expected 2"
+    }
+    $missingAfterFailedUninstall = @(
+      $launcher,
+      $manager,
+      $uninstaller,
+      $quietUninstallBootstrap,
+      $desktopLauncher,
+      $desktopManager,
+      $startMenuDir,
+      $startMenuLauncher,
+      $startMenuManager,
+      $startMenuUninstaller,
+      $productKey,
+      $uninstallKey,
+      $protocolRoot,
+      $protocolKey
+    ) | Where-Object { -not (Test-Path -LiteralPath $_) }
+    if ($missingAfterFailedUninstall) {
+      throw "Failed quiet uninstall removed owned state: $($missingAfterFailedUninstall -join ', ')"
+    }
+    Assert-ForeignSameNameProcesses -Entries $foreignEntries -Phase "after failed uninstall"
+  } finally {
+    $managerLock.Dispose()
+  }
+
+  Assert-RequiredPaths
+  Assert-AuthenticodeSignatures
+
+  $uninstallHelper = Start-Process -FilePath $launcher -ArgumentList "--helper-only" -PassThru
+  Start-Sleep -Seconds 2
+  if ($uninstallHelper.HasExited) {
+    throw "Installed launcher helper exited before uninstall"
+  }
+
+  $uninstallExitCode = Start-RegisteredCommand -CommandLine $registeredCommands.Quiet
+  if ($uninstallExitCode -ne 0) {
+    throw "Registered uninstaller exited with $uninstallExitCode"
+  }
+  if (-not $uninstallHelper.WaitForExit(5000)) {
+    Stop-Process -Id $uninstallHelper.Id -Force
+    throw "Uninstall did not stop the running launcher"
+  }
+  Assert-ForeignSameNameProcesses -Entries $foreignEntries -Phase "after uninstall"
+
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    $remaining = @(
+      $installDir,
+      $launcher,
+      $manager,
+      $uninstaller,
+      $quietUninstallBootstrap,
+      $desktopLauncher,
+      $desktopManager,
+      $startMenuDir,
+      $startMenuLauncher,
+      $startMenuManager,
+      $startMenuUninstaller,
+      $productKey,
+      $uninstallKey,
+      $protocolRoot,
+      $protocolKey
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+    if (-not $remaining) {
+      break
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  if ($remaining) {
+    throw "Uninstaller left behind: $($remaining -join ', ')"
+  }
+} finally {
+  foreach ($ownedTestProcess in @($helper, $uninstallHelper)) {
+    if ($null -ne $ownedTestProcess -and -not $ownedTestProcess.HasExited) {
+      Stop-Process -Id $ownedTestProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+  }
+  foreach ($entry in $foreignEntries) {
+    if (-not $entry.Process.HasExited) {
+      Stop-Process -Id $entry.Process.Id -Force -ErrorAction SilentlyContinue
+      $entry.Process.WaitForExit(5000)
+    }
+  }
+  foreach ($foreignName in @("codex-plus-plus.exe", "codex-plus-plus-manager.exe")) {
+    $foreignPath = Join-Path $foreignDir $foreignName
+    if (Test-Path -LiteralPath $foreignPath) {
+      Remove-Item -LiteralPath $foreignPath -Force
+    }
+  }
+  if (Test-Path -LiteralPath $foreignDir) {
+    Remove-Item -LiteralPath $foreignDir -Force
+  }
 }
