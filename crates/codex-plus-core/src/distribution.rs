@@ -23,7 +23,7 @@ pub const UPDATES_ENABLED: bool = false;
 pub const BACKGROUND_FEATURES_ENABLED: bool = false;
 
 pub const UPDATE_FEED_URL: &str = "https://token.u-studio.cn/uapi-connect/latest.json";
-pub const UPDATE_REPOSITORY: &str = "U-Studio/UAPIConnect";
+pub const UPDATE_REPOSITORY: &str = "BA7IEE/UAPIConnect";
 pub const SOURCE_UPSTREAM_URL: &str = "https://github.com/BigPizzaV3/CodexPlusPlus";
 pub const HELP_URL: &str = "https://token.u-studio.cn/";
 

@@ -1087,9 +1087,9 @@ impl SettingsStore {
             }
         };
 
-        Ok(normalize_settings_config_sections(
-            serde_json::from_str(&contents).unwrap_or_default(),
-        ))
+        let settings = serde_json::from_str(&contents)
+            .with_context(|| format!("settings file is invalid JSON: {}", self.path.display()))?;
+        Ok(normalize_settings_config_sections(settings))
     }
 
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {
@@ -1097,6 +1097,28 @@ impl SettingsStore {
         settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
         let bytes = serde_json::to_vec_pretty(&settings)?;
         atomic_write(&self.path, &bytes)
+    }
+
+    pub(crate) fn snapshot_bytes(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        match fs::read(&self.path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to read settings {}", self.path.display())),
+        }
+    }
+
+    pub(crate) fn restore_bytes(&self, snapshot: Option<&[u8]>) -> anyhow::Result<()> {
+        match snapshot {
+            Some(bytes) => atomic_write(&self.path, bytes),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).with_context(|| {
+                    format!("failed to remove restored settings {}", self.path.display())
+                }),
+            },
+        }
     }
 
     pub fn update(&self, payload: Value) -> anyhow::Result<BackendSettings> {
@@ -1107,7 +1129,8 @@ impl SettingsStore {
         let mut raw = self.load_raw_object()?;
         merge_known_setting_fields(&mut raw, &payload);
         let settings = normalize_settings_config_sections(
-            serde_json::from_value(Value::Object(raw.clone())).unwrap_or_default(),
+            serde_json::from_value(Value::Object(raw.clone()))
+                .context("updated settings contain invalid field values")?,
         );
         raw.insert(
             "relayCommonConfigContents".to_string(),
@@ -1134,9 +1157,14 @@ impl SettingsStore {
             }
         };
 
-        match serde_json::from_str::<Value>(&contents) {
-            Ok(Value::Object(map)) => Ok(map),
-            Ok(_) | Err(_) => Ok(settings_to_object(&BackendSettings::default())),
+        match serde_json::from_str::<Value>(&contents)
+            .with_context(|| format!("settings file is invalid JSON: {}", self.path.display()))?
+        {
+            Value::Object(map) => Ok(map),
+            _ => anyhow::bail!(
+                "settings file root must be a JSON object: {}",
+                self.path.display()
+            ),
         }
     }
 }
@@ -2429,13 +2457,34 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
-    fn settings_store_load_bad_json_returns_default() {
+    fn settings_store_load_bad_json_returns_error_without_overwriting_file() {
         let dir = temp_dir();
         let path = dir.join("settings.json");
-        std::fs::write(&path, "{bad json").unwrap();
-        let store = SettingsStore::new(path);
+        let damaged = "{bad json";
+        std::fs::write(&path, damaged).unwrap();
+        let store = SettingsStore::new(path.clone());
 
-        assert_eq!(store.load().unwrap(), BackendSettings::default());
+        let error = store.load().unwrap_err().to_string();
+
+        assert!(error.contains("invalid JSON"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn settings_store_update_bad_json_returns_error_without_overwriting_file() {
+        let dir = temp_dir();
+        let path = dir.join("settings.json");
+        let damaged = "{bad json";
+        std::fs::write(&path, damaged).unwrap();
+        let store = SettingsStore::new(path.clone());
+
+        let error = store
+            .update(serde_json::json!({"codexAppPath": "/Applications/Codex.app"}))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid JSON"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), damaged);
     }
 
     #[test]

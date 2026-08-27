@@ -11,7 +11,7 @@
   "helpUrl": "https://token.u-studio.cn/",
   "upstreamSourceUrl": "https://github.com/BigPizzaV3/CodexPlusPlus",
   "updateFeedUrl": "https://token.u-studio.cn/uapi-connect/latest.json",
-  "updateRepository": "U-Studio/UAPIConnect",
+  "updateRepository": "BA7IEE/UAPIConnect",
   "features": {
     "fixedProviderEdition": true,
     "adsEnabled": false,

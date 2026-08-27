@@ -73,6 +73,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::backend_version,
             uapi_commands::uapi_status,
+            uapi_commands::uapi_take_manager_activation,
             uapi_commands::uapi_validate_key,
             uapi_commands::uapi_configure,
             uapi_commands::uapi_refresh_models,
@@ -202,13 +203,18 @@ pub fn run() {
     match app_result {
         Ok(app) => app.run(|app_handle, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = event {
-                for url in urls {
-                    if handle_session_share_url(url.as_str()) || handle_dream_skin_url(url.as_str())
-                    {
-                        show_main_window(app_handle);
+            match event {
+                tauri::RunEvent::Opened { urls } => {
+                    for url in urls {
+                        if handle_session_share_url(url.as_str())
+                            || handle_dream_skin_url(url.as_str())
+                        {
+                            show_main_window(app_handle);
+                        }
                     }
                 }
+                tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
+                _ => {}
             }
         }),
         Err(error) => {
@@ -450,7 +456,8 @@ fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
 
 /// Restores and focuses an existing manager window on Windows.
 ///
-/// This is a no-op on other platforms.
+/// macOS reactivation is delivered to the existing bundle as `RunEvent::Reopen`.
+/// This process-level fallback is a no-op on other platforms.
 pub fn focus_existing_manager_window() {
     #[cfg(windows)]
     {

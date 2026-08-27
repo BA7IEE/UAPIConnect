@@ -1,6 +1,30 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--uninstall-cleanup") {
+        if !codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+            eprintln!("--uninstall-cleanup is only supported by U-API Connect");
+            std::process::exit(2);
+        }
+        match codex_plus_core::uapi::uninstall_cleanup() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("U-API uninstall cleanup failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let configure_requested = std::env::args().any(|arg| arg == "--configure");
+    if configure_requested && codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
+        if let Err(error) = codex_plus_core::manager_activation::request_configure() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.configure_activation_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        }
+    }
+
     for arg in std::env::args() {
         if codex_plus_core::distribution::FIXED_PROVIDER_EDITION {
             continue;
@@ -43,7 +67,7 @@ fn main() {
             std::env::set_var("CODEX_PLUS_SHOW_UPDATE", "1");
         }
     }
-    if std::env::args().any(|arg| arg == "--configure") {
+    if configure_requested {
         unsafe {
             std::env::set_var("UAPI_CONNECT_CONFIGURE", "1");
         }

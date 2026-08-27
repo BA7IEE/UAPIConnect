@@ -30,9 +30,13 @@ enum FixedProviderLaunchPreparation {
 
 fn fixed_provider_launch_preparation(status: &UapiStatus) -> FixedProviderLaunchPreparation {
     match status.connection_mode {
-        UapiConnectionMode::Uapi if !status.configured => {
+        UapiConnectionMode::Uapi if !status.configured && !status.uapi_ready => {
             FixedProviderLaunchPreparation::OpenConnectionSettings
         }
+        // `uapi_ready` means the key and model profile are still available even
+        // when config.toml/auth.json were changed externally. Continue through
+        // the normal launch path: refresh is best-effort, and the fixed-edition
+        // apply hook restores the cached profile before Codex starts.
         UapiConnectionMode::Uapi => FixedProviderLaunchPreparation::RefreshModels,
         // 官方登录由原生 Codex 完成，未登录时也必须继续启动才能进入登录流程。
         UapiConnectionMode::Official => FixedProviderLaunchPreparation::Continue,
@@ -1214,6 +1218,17 @@ mod tests {
         );
         assert_eq!(
             fixed_provider_launch_preparation(&configured),
+            FixedProviderLaunchPreparation::RefreshModels
+        );
+    }
+
+    #[test]
+    fn cached_uapi_profile_repairs_missing_live_configuration_during_launch() {
+        let mut repairable = fixed_provider_status(UapiConnectionMode::Uapi, false, false);
+        repairable.uapi_ready = true;
+
+        assert_eq!(
+            fixed_provider_launch_preparation(&repairable),
             FixedProviderLaunchPreparation::RefreshModels
         );
     }

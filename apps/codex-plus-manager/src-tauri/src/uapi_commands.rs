@@ -34,6 +34,9 @@ pub struct DiagnosticsPayload {
     pub report: String,
 }
 
+type ManagerActivationResult =
+    Result<Option<codex_plus_core::manager_activation::ManagerActivation>, String>;
+
 fn ok<T>(message: &str, payload: T) -> CommandResult<T>
 where
     T: Serialize,
@@ -59,6 +62,11 @@ where
 #[tauri::command]
 pub fn uapi_status() -> CommandResult<codex_plus_core::uapi::UapiStatus> {
     ok("连接状态已读取。", codex_plus_core::uapi::status())
+}
+
+#[tauri::command]
+pub fn uapi_take_manager_activation() -> ManagerActivationResult {
+    codex_plus_core::manager_activation::take_pending().map_err(|error| error.to_string())
 }
 
 #[tauri::command]

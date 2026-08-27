@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-const APP_STATE_DIR: &str = ".codex-session-delete";
+const UPSTREAM_APP_STATE_DIR: &str = ".codex-session-delete";
+const UAPI_APP_STATE_DIR: &str = ".uapi-connect";
 const SETTINGS_FILE: &str = "settings.json";
 const LATEST_STATUS_FILE: &str = "latest-status.json";
 const DIAGNOSTIC_LOG_FILE: &str = "codex-plus.log";
@@ -13,11 +14,31 @@ const SKILLS_DIR: &str = "skills";
 const SKILL_BACKUPS_DIR: &str = "skill-backups";
 
 pub fn default_app_state_dir() -> PathBuf {
+    let state_dir = if crate::distribution::FIXED_PROVIDER_EDITION {
+        UAPI_APP_STATE_DIR
+    } else {
+        UPSTREAM_APP_STATE_DIR
+    };
     if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        return home_dir.join(APP_STATE_DIR);
+        return home_dir.join(state_dir);
     }
 
-    PathBuf::from(APP_STATE_DIR)
+    PathBuf::from(state_dir)
+}
+
+/// Previous releases shared this directory with CodexPlusPlus. It is only
+/// exposed so the fixed U-API distribution can migrate or remove data that is
+/// unambiguously owned by U-API Connect.
+pub fn legacy_upstream_app_state_dir() -> PathBuf {
+    if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+        return home_dir.join(UPSTREAM_APP_STATE_DIR);
+    }
+
+    PathBuf::from(UPSTREAM_APP_STATE_DIR)
+}
+
+pub fn legacy_upstream_settings_path() -> PathBuf {
+    legacy_upstream_app_state_dir().join(SETTINGS_FILE)
 }
 
 pub fn default_settings_path() -> PathBuf {
@@ -100,41 +121,46 @@ mod tests {
         let _guard = settings_path_test_guard();
         let path = default_settings_path();
 
-        assert!(path.ends_with(".codex-session-delete/settings.json"));
+        assert!(path.ends_with(".uapi-connect/settings.json"));
     }
 
     #[test]
     fn default_latest_status_path_uses_app_state_directory() {
         let path = default_latest_status_path();
 
-        assert!(path.ends_with(".codex-session-delete/latest-status.json"));
+        assert!(path.ends_with(".uapi-connect/latest-status.json"));
     }
 
     #[test]
     fn default_diagnostic_log_path_uses_app_state_directory() {
         let path = default_diagnostic_log_path();
 
-        assert!(path.ends_with(".codex-session-delete/codex-plus.log"));
+        assert!(path.ends_with(".uapi-connect/codex-plus.log"));
     }
 
     #[test]
     fn default_pending_provider_import_path_uses_app_state_directory() {
         let path = default_pending_provider_import_path();
 
-        assert!(path.ends_with(".codex-session-delete/pending-provider-import.json"));
+        assert!(path.ends_with(".uapi-connect/pending-provider-import.json"));
     }
 
     #[test]
     fn default_pending_session_share_path_uses_app_state_directory() {
         let path = default_pending_session_share_path();
 
-        assert!(path.ends_with(".codex-session-delete/pending-session-share.txt"));
+        assert!(path.ends_with(".uapi-connect/pending-session-share.txt"));
     }
 
     #[test]
     fn default_pending_remote_control_recovery_path_uses_app_state_directory() {
         let path = default_pending_remote_control_recovery_path();
 
-        assert!(path.ends_with(".codex-session-delete/pending-remote-control-recovery.json"));
+        assert!(path.ends_with(".uapi-connect/pending-remote-control-recovery.json"));
+    }
+
+    #[test]
+    fn legacy_settings_path_remains_scoped_to_upstream_state_directory() {
+        assert!(legacy_upstream_settings_path().ends_with(".codex-session-delete/settings.json"));
     }
 }

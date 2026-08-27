@@ -657,8 +657,6 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
-    codex_plus_core::watcher::stop_launcher_processes_and_wait();
-    codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
     let home = codex_plus_core::relay_config::default_codex_home_dir();
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "manager.restart_requested",
@@ -685,6 +683,10 @@ pub fn restart_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             }),
         );
     }
+    // 先确认状态文件可写，再停止当前进程。否则磁盘或权限错误会让命令
+    // 返回“未执行重启”，实际却已经把正在使用的 Codex 关闭。
+    codex_plus_core::watcher::stop_launcher_processes_and_wait();
+    codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(request.debug_port);
     match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), spawn_silent_launcher) {
         Ok(()) => CommandResult {
             status: "accepted".to_string(),
@@ -6021,6 +6023,32 @@ mod tests {
         let status = requested_launch_status(&request, "starting", "starting", 1);
 
         assert_eq!(status.codex_app, None);
+    }
+
+    #[test]
+    fn restart_persists_starting_status_before_stopping_running_processes() {
+        let source = include_str!("commands.rs");
+        let restart_start = source
+            .find("pub fn restart_codex_plus")
+            .expect("restart command");
+        let restart_end = source[restart_start..]
+            .find("fn restart_codex_plus_after_stop")
+            .map(|offset| restart_start + offset)
+            .expect("restart helper");
+        let restart = &source[restart_start..restart_end];
+
+        let save_status = restart
+            .find("save_requested_launch_status")
+            .expect("starting status write");
+        let stop_launcher = restart
+            .find("stop_launcher_processes_and_wait")
+            .expect("launcher stop");
+        let stop_codex = restart
+            .find("stop_codex_processes_for_debug_port_and_wait")
+            .expect("Codex stop");
+
+        assert!(save_status < stop_launcher);
+        assert!(save_status < stop_codex);
     }
 
     #[test]

@@ -94,6 +94,7 @@ struct EncryptedOfficialAuth {
 struct FileBackedCredentialVault<B> {
     keyring: B,
     official_auth_path: PathBuf,
+    legacy_official_auth_path: Option<PathBuf>,
 }
 
 impl<B> FileBackedCredentialVault<B>
@@ -104,20 +105,42 @@ where
         Self {
             keyring,
             official_auth_path,
+            legacy_official_auth_path: None,
         }
+    }
+
+    fn with_legacy_official_auth_path(mut self, path: PathBuf) -> Self {
+        if path != self.official_auth_path {
+            self.legacy_official_auth_path = Some(path);
+        }
+        self
     }
 
     fn with_official_auth_lock<T>(
         &self,
         operation: impl FnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let lock_path = self
-            .official_auth_path
-            .with_file_name(OFFICIAL_AUTH_LOCK_FILE_NAME);
-        let lock_file = open_lock_file(&lock_path)?;
-        lock_file
-            .lock_exclusive()
-            .with_context(|| format!("锁定官方登录快照失败：{}", lock_path.display()))?;
+        let mut lock_paths = vec![
+            self.official_auth_path
+                .with_file_name(OFFICIAL_AUTH_LOCK_FILE_NAME),
+        ];
+        if let Some(legacy_path) = self.legacy_official_auth_path.as_deref() {
+            lock_paths.push(legacy_path.with_file_name(OFFICIAL_AUTH_LOCK_FILE_NAME));
+        }
+        lock_paths.sort();
+        lock_paths.dedup();
+
+        // Every process acquires both the isolated and legacy lock in the same
+        // path order. This keeps migration compatible with an older process
+        // that still protects only the shared legacy directory.
+        let mut lock_files = Vec::with_capacity(lock_paths.len());
+        for lock_path in lock_paths {
+            let lock_file = open_lock_file(&lock_path)?;
+            lock_file
+                .lock_exclusive()
+                .with_context(|| format!("锁定官方登录快照失败：{}", lock_path.display()))?;
+            lock_files.push(lock_file);
+        }
         operation()
     }
 
@@ -136,10 +159,48 @@ where
         };
 
         if let Some(encrypted) = encrypted {
-            let contents = self.decrypt_official_auth(&encrypted)?;
-            // A previous cleanup may have been interrupted after the encrypted
-            // file was committed. Retry on every successful read, but cleanup
-            // failure must not make a valid encrypted snapshot unavailable.
+            // Read the master key exactly once. A transient keyring error must
+            // not be mistaken for corrupt current ciphertext and trigger a
+            // rollback to an older legacy snapshot.
+            let master_key = self.decryption_master_key()?;
+            match Self::decrypt_official_auth_with_key(&encrypted, &master_key) {
+                Ok(contents) => {
+                    // A previous cleanup may have been interrupted after the
+                    // encrypted file was committed. Retry on every successful
+                    // read, but cleanup failure must not hide a valid snapshot.
+                    let _ = self.keyring.delete(LEGACY_OFFICIAL_AUTH_ACCOUNT);
+                    return Ok(Some(contents));
+                }
+                Err(current_error) => {
+                    if let Some(legacy_path) = self.legacy_official_auth_path.as_deref()
+                        && let Some(legacy_encrypted) = read_encrypted_snapshot(legacy_path)?
+                    {
+                        match Self::decrypt_official_auth_with_key(&legacy_encrypted, &master_key) {
+                            Ok(contents) => {
+                                self.commit_migrated_official_auth(&legacy_encrypted, legacy_path)?;
+                                let _ = self.keyring.delete(LEGACY_OFFICIAL_AUTH_ACCOUNT);
+                                return Ok(Some(contents));
+                            }
+                            Err(legacy_error) => {
+                                anyhow::bail!(
+                                    "当前和旧版官方登录快照均无法解密：当前={current_error}；旧版={legacy_error}"
+                                );
+                            }
+                        }
+                    }
+                    return Err(current_error).context("当前加密官方登录快照无法读取");
+                }
+            }
+        }
+
+        if let Some(legacy_path) = self.legacy_official_auth_path.as_deref()
+            && let Some(legacy_encrypted) = read_encrypted_snapshot(legacy_path)?
+        {
+            // Decrypt before publishing or removing anything. A corrupt legacy
+            // file must remain available for manual recovery.
+            let master_key = self.decryption_master_key()?;
+            let contents = Self::decrypt_official_auth_with_key(&legacy_encrypted, &master_key)?;
+            self.commit_migrated_official_auth(&legacy_encrypted, legacy_path)?;
             let _ = self.keyring.delete(LEGACY_OFFICIAL_AUTH_ACCOUNT);
             return Ok(Some(contents));
         }
@@ -151,6 +212,21 @@ where
         };
         self.write_official_auth(&legacy)?;
         Ok(Some(legacy))
+    }
+
+    fn commit_migrated_official_auth(
+        &self,
+        encrypted: &[u8],
+        legacy_path: &Path,
+    ) -> anyhow::Result<()> {
+        // The envelope uses the same keyring master key. Publish and fsync the
+        // isolated copy before attempting best-effort cleanup of the old one.
+        crate::settings::atomic_write_private(&self.official_auth_path, encrypted)
+            .context("迁移加密官方登录快照失败")?;
+        restrict_file_permissions(&self.official_auth_path)?;
+        sync_encrypted_file(&self.official_auth_path)?;
+        let _ = remove_file_if_present(legacy_path);
+        Ok(())
     }
 
     fn write_official_auth(&self, secret: &str) -> anyhow::Result<()> {
@@ -184,7 +260,15 @@ where
         Ok(())
     }
 
-    fn decrypt_official_auth(&self, encrypted: &[u8]) -> anyhow::Result<String> {
+    fn decryption_master_key(&self) -> anyhow::Result<[u8; AES_256_KEY_LEN]> {
+        self.existing_master_key()?
+            .ok_or_else(|| anyhow::anyhow!("系统凭证库中缺少官方登录快照主密钥"))
+    }
+
+    fn decrypt_official_auth_with_key(
+        encrypted: &[u8],
+        master_key: &[u8; AES_256_KEY_LEN],
+    ) -> anyhow::Result<String> {
         let envelope = serde_json::from_slice::<EncryptedOfficialAuth>(encrypted)
             .context("加密官方登录快照格式无效")?;
         if envelope.version != OFFICIAL_AUTH_FILE_VERSION {
@@ -199,10 +283,7 @@ where
         let ciphertext = BASE64
             .decode(envelope.ciphertext)
             .context("官方登录快照密文无效")?;
-        let master_key = self
-            .existing_master_key()?
-            .ok_or_else(|| anyhow::anyhow!("系统凭证库中缺少官方登录快照主密钥"))?;
-        let cipher = Aes256Gcm::new_from_slice(&master_key)
+        let cipher = Aes256Gcm::new_from_slice(master_key)
             .map_err(|_| anyhow::anyhow!("初始化官方登录快照解密器失败"))?;
         let plaintext = cipher
             .decrypt(
@@ -243,12 +324,33 @@ where
         // 必须先确认旧 direct entry 已删除，再删除加密文件。否则旧条目删除
         // 失败时，下次读取会把本应删除的登录快照重新迁移回来。
         self.keyring.delete(LEGACY_OFFICIAL_AUTH_ACCOUNT)?;
-        match std::fs::remove_file(&self.official_auth_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("删除加密官方登录快照失败"),
+        remove_file_if_present(&self.official_auth_path).context("删除加密官方登录快照失败")?;
+        if let Some(legacy_path) = self.legacy_official_auth_path.as_deref() {
+            remove_file_if_present(legacy_path).context("删除旧版加密官方登录快照失败")?;
         }
+        // The master key has no purpose once every encrypted payload has been
+        // removed. Delete it last so an interrupted cleanup never leaves an
+        // undecryptable snapshot behind.
+        self.keyring.delete(OFFICIAL_AUTH_MASTER_KEY_ACCOUNT)?;
         Ok(())
+    }
+}
+
+fn read_encrypted_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("读取旧版加密官方登录快照失败：{}", path.display()))
+        }
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -336,8 +438,11 @@ impl Default for SystemCredentialVault {
     fn default() -> Self {
         let official_auth_path =
             official_auth_path_for_settings(&crate::paths::default_settings_path());
+        let legacy_official_auth_path =
+            official_auth_path_for_settings(&crate::paths::legacy_upstream_settings_path());
         Self {
-            inner: FileBackedCredentialVault::new(SystemKeyringBackend, official_auth_path),
+            inner: FileBackedCredentialVault::new(SystemKeyringBackend, official_auth_path)
+                .with_legacy_official_auth_path(legacy_official_auth_path),
         }
     }
 }
@@ -386,6 +491,7 @@ pub(crate) mod testing {
         secrets: Mutex<HashMap<CredentialSlot, String>>,
         failing_gets: Mutex<HashSet<CredentialSlot>>,
         failing_sets: Mutex<HashSet<CredentialSlot>>,
+        failing_deletes: Mutex<HashSet<CredentialSlot>>,
     }
 
     impl MemoryCredentialVault {
@@ -395,6 +501,10 @@ pub(crate) mod testing {
 
         pub(crate) fn fail_set(&self, slot: CredentialSlot) {
             self.failing_sets.lock().unwrap().insert(slot);
+        }
+
+        pub(crate) fn fail_delete(&self, slot: CredentialSlot) {
+            self.failing_deletes.lock().unwrap().insert(slot);
         }
     }
 
@@ -418,6 +528,9 @@ pub(crate) mod testing {
         }
 
         fn delete(&self, slot: CredentialSlot) -> anyhow::Result<()> {
+            if self.failing_deletes.lock().unwrap().contains(&slot) {
+                anyhow::bail!("simulated credential delete failure");
+            }
             self.secrets.lock().unwrap().remove(&slot);
             Ok(())
         }
@@ -435,6 +548,7 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct MemoryKeyringBackend {
         secrets: Arc<Mutex<HashMap<String, String>>>,
+        failing_gets: Arc<Mutex<HashMap<String, usize>>>,
         failing_deletes: Arc<Mutex<HashSet<String>>>,
     }
 
@@ -453,10 +567,27 @@ mod tests {
                 .unwrap()
                 .insert(account.to_string());
         }
+
+        fn fail_next_get(&self, account: &str) {
+            *self
+                .failing_gets
+                .lock()
+                .unwrap()
+                .entry(account.to_string())
+                .or_default() += 1;
+        }
     }
 
     impl KeyringBackend for MemoryKeyringBackend {
         fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+            let mut failing_gets = self.failing_gets.lock().unwrap();
+            if let Some(remaining) = failing_gets.get_mut(account)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                anyhow::bail!("simulated keyring get failure");
+            }
+            drop(failing_gets);
             Ok(self.value(account))
         }
 
@@ -804,6 +935,207 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("current snapshot")
+        );
+    }
+
+    #[test]
+    fn explicit_delete_removes_encrypted_snapshot_and_master_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(OFFICIAL_AUTH_FILE_NAME);
+        let keyring = MemoryKeyringBackend::default();
+        let vault = FileBackedCredentialVault::new(keyring.clone(), path.clone());
+        vault
+            .set(CredentialSlot::OfficialAuthJson, "current snapshot")
+            .unwrap();
+        let lock_path = temp.path().join(OFFICIAL_AUTH_LOCK_FILE_NAME);
+        assert!(lock_path.is_file());
+
+        vault.delete(CredentialSlot::OfficialAuthJson).unwrap();
+
+        assert!(!path.exists());
+        assert!(lock_path.is_file());
+        assert!(keyring.value(OFFICIAL_AUTH_MASTER_KEY_ACCOUNT).is_none());
+        assert!(keyring.value(LEGACY_OFFICIAL_AUTH_ACCOUNT).is_none());
+    }
+
+    #[test]
+    fn explicit_delete_keeps_legacy_lock_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy").join(OFFICIAL_AUTH_FILE_NAME);
+        let isolated_path = temp.path().join("isolated").join(OFFICIAL_AUTH_FILE_NAME);
+        let keyring = MemoryKeyringBackend::default();
+        let legacy_vault = FileBackedCredentialVault::new(keyring.clone(), legacy_path.clone());
+        legacy_vault
+            .set(CredentialSlot::OfficialAuthJson, "legacy snapshot")
+            .unwrap();
+        let legacy_lock_path = legacy_path.with_file_name(OFFICIAL_AUTH_LOCK_FILE_NAME);
+        assert!(legacy_lock_path.is_file());
+        let isolated_vault = FileBackedCredentialVault::new(keyring, isolated_path)
+            .with_legacy_official_auth_path(legacy_path);
+
+        isolated_vault
+            .delete(CredentialSlot::OfficialAuthJson)
+            .unwrap();
+
+        assert!(legacy_lock_path.is_file());
+    }
+
+    #[test]
+    fn encrypted_snapshot_moves_from_shared_legacy_directory_on_first_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy").join(OFFICIAL_AUTH_FILE_NAME);
+        let isolated_path = temp.path().join("isolated").join(OFFICIAL_AUTH_FILE_NAME);
+        let keyring = MemoryKeyringBackend::default();
+        let legacy_vault = FileBackedCredentialVault::new(keyring.clone(), legacy_path.clone());
+        legacy_vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                "legacy encrypted snapshot",
+            )
+            .unwrap();
+        let isolated_vault = FileBackedCredentialVault::new(keyring, isolated_path.clone())
+            .with_legacy_official_auth_path(legacy_path.clone());
+
+        assert_eq!(
+            isolated_vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .as_deref(),
+            Some("legacy encrypted snapshot")
+        );
+        assert!(isolated_path.is_file());
+        assert!(!legacy_path.exists());
+    }
+
+    #[test]
+    fn valid_legacy_snapshot_recovers_a_corrupted_current_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy").join(OFFICIAL_AUTH_FILE_NAME);
+        let isolated_path = temp.path().join("isolated").join(OFFICIAL_AUTH_FILE_NAME);
+        let keyring = MemoryKeyringBackend::default();
+        let legacy_vault = FileBackedCredentialVault::new(keyring.clone(), legacy_path.clone());
+        legacy_vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                "recoverable legacy snapshot",
+            )
+            .unwrap();
+        std::fs::create_dir_all(isolated_path.parent().unwrap()).unwrap();
+        std::fs::write(&isolated_path, b"corrupted current ciphertext").unwrap();
+        let isolated_vault = FileBackedCredentialVault::new(keyring, isolated_path.clone())
+            .with_legacy_official_auth_path(legacy_path.clone());
+
+        assert_eq!(
+            isolated_vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .as_deref(),
+            Some("recoverable legacy snapshot")
+        );
+        assert!(!legacy_path.exists());
+        assert_ne!(
+            std::fs::read(&isolated_path).unwrap(),
+            b"corrupted current ciphertext"
+        );
+        assert_eq!(
+            isolated_vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .as_deref(),
+            Some("recoverable legacy snapshot")
+        );
+    }
+
+    #[test]
+    fn transient_master_key_read_failure_never_replaces_current_with_legacy() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy").join(OFFICIAL_AUTH_FILE_NAME);
+        let isolated_path = temp.path().join("isolated").join(OFFICIAL_AUTH_FILE_NAME);
+        let keyring = MemoryKeyringBackend::default();
+        FileBackedCredentialVault::new(keyring.clone(), legacy_path.clone())
+            .set(CredentialSlot::OfficialAuthJson, "older legacy snapshot")
+            .unwrap();
+        FileBackedCredentialVault::new(keyring.clone(), isolated_path.clone())
+            .set(CredentialSlot::OfficialAuthJson, "newest current snapshot")
+            .unwrap();
+        let current_before = std::fs::read(&isolated_path).unwrap();
+        let legacy_before = std::fs::read(&legacy_path).unwrap();
+        keyring.fail_next_get(OFFICIAL_AUTH_MASTER_KEY_ACCOUNT);
+        let vault = FileBackedCredentialVault::new(keyring, isolated_path.clone())
+            .with_legacy_official_auth_path(legacy_path.clone());
+
+        assert!(vault.get(CredentialSlot::OfficialAuthJson).is_err());
+        assert_eq!(std::fs::read(&isolated_path).unwrap(), current_before);
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+        assert_eq!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .as_deref(),
+            Some("newest current snapshot")
+        );
+    }
+
+    #[test]
+    fn corrupted_current_and_legacy_snapshots_are_preserved_on_read_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy").join(OFFICIAL_AUTH_FILE_NAME);
+        let isolated_path = temp.path().join("isolated").join(OFFICIAL_AUTH_FILE_NAME);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(isolated_path.parent().unwrap()).unwrap();
+        let current_bytes = b"corrupted current ciphertext";
+        let legacy_bytes = b"corrupted legacy ciphertext";
+        std::fs::write(&isolated_path, current_bytes).unwrap();
+        std::fs::write(&legacy_path, legacy_bytes).unwrap();
+        let vault =
+            FileBackedCredentialVault::new(MemoryKeyringBackend::default(), isolated_path.clone())
+                .with_legacy_official_auth_path(legacy_path.clone());
+
+        assert!(vault.get(CredentialSlot::OfficialAuthJson).is_err());
+
+        assert_eq!(std::fs::read(isolated_path).unwrap(), current_bytes);
+        assert_eq!(std::fs::read(legacy_path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn isolated_vault_waits_for_the_legacy_process_lock() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_path = temp.path().join("legacy").join(OFFICIAL_AUTH_FILE_NAME);
+        let isolated_path = temp.path().join("isolated").join(OFFICIAL_AUTH_FILE_NAME);
+        let legacy_lock_path = legacy_path.with_file_name(OFFICIAL_AUTH_LOCK_FILE_NAME);
+        let held_legacy_lock = open_lock_file(&legacy_lock_path).unwrap();
+        held_legacy_lock.lock_exclusive().unwrap();
+        let vault =
+            FileBackedCredentialVault::new(MemoryKeyringBackend::default(), isolated_path.clone())
+                .with_legacy_official_auth_path(legacy_path);
+        let (finished_tx, finished_rx) = mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            finished_tx
+                .send(vault.get(CredentialSlot::OfficialAuthJson))
+                .unwrap();
+        });
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        FileExt::unlock(&held_legacy_lock).unwrap();
+
+        assert!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        worker.join().unwrap();
+        assert!(legacy_lock_path.is_file());
+        assert!(
+            isolated_path
+                .with_file_name(OFFICIAL_AUTH_LOCK_FILE_NAME)
+                .is_file()
         );
     }
 }

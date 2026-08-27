@@ -14,7 +14,7 @@ use anyhow::Context;
 use credentials::{CredentialSlot, CredentialVault, SystemCredentialVault};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::distribution;
 use crate::settings::{
@@ -104,11 +104,15 @@ struct ModelCandidate {
 
 pub fn status() -> UapiStatus {
     let vault = SystemCredentialVault::default();
-    status_from_home_with_vault(
-        &crate::codex_home::default_codex_home_dir(),
-        &SettingsStore::default(),
-        &vault,
-    )
+    let store = SettingsStore::default();
+    let migration = prepare_default_distribution_state(&store, &vault);
+    let mut status =
+        status_from_home_with_vault(&crate::codex_home::default_codex_home_dir(), &store, &vault);
+    if let Err(error) = migration {
+        status.credential_store_available = false;
+        status.credential_store_message = format!("迁移旧版 U-API 数据失败：{error}");
+    }
+    status
 }
 
 pub fn status_from_home(home: &Path, store: &SettingsStore) -> UapiStatus {
@@ -136,12 +140,13 @@ fn status_from_home_with_vault_locked(
     allow_migration: bool,
 ) -> UapiStatus {
     let mut settings = store.load().unwrap_or_default();
-    let has_legacy_key = settings
+    let legacy_profile_key = settings
         .relay_profiles
         .iter()
-        .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        .find(|profile| managed_profile_is_owned(profile))
         .map(crate::relay_config::relay_profile_api_key)
-        .is_some_and(|key| !key.trim().is_empty());
+        .filter(|key| !key.trim().is_empty());
+    let has_legacy_key = legacy_profile_key.is_some();
     let legacy_migration = if allow_migration {
         migrate_legacy_managed_api_key(store, &mut settings, vault)
     } else if has_legacy_key {
@@ -156,18 +161,15 @@ fn status_from_home_with_vault_locked(
     let profile = settings
         .relay_profiles
         .iter()
-        .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID);
+        .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        .and_then(|profile| canonicalize_managed_profile(profile).ok());
     let live = read_live_managed_state(home);
     let api_key = stored_api_key
         .filter(|api_key| !api_key.trim().is_empty())
-        .or_else(|| {
-            profile
-                .map(crate::relay_config::relay_profile_api_key)
-                .filter(|api_key| !api_key.trim().is_empty())
-        })
+        .or(legacy_profile_key)
         .or_else(|| live_managed_api_key(home, &live))
         .unwrap_or_default();
-    let compatible_models = profile.map(profile_model_ids).unwrap_or_default();
+    let compatible_models = profile.as_ref().map(profile_model_ids).unwrap_or_default();
     let official_auth = crate::relay_config::chatgpt_auth_status_from_home(home);
     let official_login_saved = stored_official_auth
         .as_deref()
@@ -177,6 +179,7 @@ fn status_from_home_with_vault_locked(
         .filter(|model| contains_model(&compatible_models, model))
         .or_else(|| {
             profile
+                .as_ref()
                 .map(crate::relay_config::relay_profile_model)
                 .filter(|model| contains_model(&compatible_models, model))
         })
@@ -263,7 +266,8 @@ pub fn enforce_distribution_defaults() -> anyhow::Result<()> {
     let home = crate::codex_home::default_codex_home_dir();
     let vault = SystemCredentialVault::default();
     crate::relay_config::with_live_files_transaction(&home, || {
-        let mut settings = store.load().unwrap_or_default();
+        prepare_default_distribution_state(&store, &vault)?;
+        let mut settings = store.load().context("读取 U-API Connect 发行版设置失败")?;
         migrate_legacy_managed_api_key(&store, &mut settings, &vault)?;
         apply_distribution_feature_defaults(&mut settings);
         store
@@ -280,8 +284,10 @@ pub async fn configure(api_key: &str) -> anyhow::Result<UapiApplyResult> {
     let api_key = normalize_api_key(api_key)?;
     let discovery = discover_models(&api_key).await?;
     let vault = SystemCredentialVault::default();
+    let store = SettingsStore::default();
+    prepare_default_distribution_state(&store, &vault)?;
     apply_discovery_with(
-        &SettingsStore::default(),
+        &store,
         &crate::codex_home::default_codex_home_dir(),
         &vault,
         &api_key,
@@ -293,6 +299,7 @@ pub async fn refresh_models() -> anyhow::Result<UapiApplyResult> {
     let store = SettingsStore::default();
     let vault = SystemCredentialVault::default();
     let home = crate::codex_home::default_codex_home_dir();
+    prepare_default_distribution_state(&store, &vault)?;
     let (api_key, migration_succeeded) =
         crate::relay_config::with_live_files_transaction(&home, || {
             let mut settings = store.load().context("读取本地连接配置失败")?;
@@ -321,6 +328,7 @@ pub fn switch_connection_mode(mode: UapiConnectionMode) -> anyhow::Result<UapiMo
     let store = SettingsStore::default();
     let home = crate::codex_home::default_codex_home_dir();
     let vault = SystemCredentialVault::default();
+    prepare_default_distribution_state(&store, &vault)?;
     switch_connection_mode_with(&store, &home, &vault, mode)
 }
 
@@ -332,7 +340,22 @@ pub fn apply_active_connection_profile() -> anyhow::Result<()> {
     let store = SettingsStore::default();
     let home = crate::codex_home::default_codex_home_dir();
     let vault = SystemCredentialVault::default();
+    prepare_default_distribution_state(&store, &vault)?;
     apply_active_connection_profile_with(&store, &home, &vault)
+}
+
+/// Removes U-API-owned live projections, credentials and profile state before
+/// the desktop binaries are uninstalled. The operation deliberately leaves all
+/// unrelated Codex configuration and authentication data in place.
+pub fn uninstall_cleanup() -> anyhow::Result<()> {
+    let home = crate::codex_home::default_codex_home_dir();
+    let vault = SystemCredentialVault::default();
+    uninstall_cleanup_with(
+        &crate::paths::default_settings_path(),
+        &crate::paths::legacy_upstream_settings_path(),
+        &home,
+        &vault,
+    )
 }
 
 fn apply_active_connection_profile_with(
@@ -364,7 +387,7 @@ fn apply_active_connection_profile_locked(
     match connection_mode(&settings) {
         UapiConnectionMode::Uapi => {
             let api_key = managed_api_key(&settings, vault, home)?;
-            let mut profile = managed_profile(&settings)?.clone();
+            let mut profile = managed_profile(&settings)?;
             prioritize_profile_models(&mut profile);
             let profile = hydrate_managed_profile(&profile, &api_key)?;
             crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
@@ -511,11 +534,11 @@ fn apply_discovery_with_options_locked(
     persist_api_key: bool,
     preserve_legacy_api_key: bool,
 ) -> anyhow::Result<UapiApplyResult> {
-    let mut settings = store.load().unwrap_or_default();
+    let mut settings = store.load().context("读取本地连接配置失败")?;
     let existing_managed_profile = settings
         .relay_profiles
         .iter()
-        .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        .find(|profile| managed_profile_is_owned(profile))
         .cloned();
     let existing_managed_model = existing_managed_profile
         .as_ref()
@@ -670,7 +693,7 @@ fn switch_to_uapi(
         .relay_profiles
         .iter()
         .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
-        .cloned()
+        .and_then(|profile| canonicalize_managed_profile(profile).ok())
     else {
         return activate_unconfigured_uapi_mode(store, home, vault, settings);
     };
@@ -772,14 +795,14 @@ fn switch_to_official(
         if let Some(profile) = settings
             .relay_profiles
             .iter_mut()
-            .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+            .find(|profile| managed_profile_is_owned(profile))
         {
             *profile = sanitize_managed_profile(profile.clone())?;
         }
     } else if let Some(profile) = settings
         .relay_profiles
         .iter_mut()
-        .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        .find(|profile| managed_profile_is_owned(profile))
     {
         // Very old settings could deserialize a plaintext `apiKey` field that is
         // intentionally skipped on the next serialization. Keep the only usable
@@ -836,12 +859,13 @@ fn mode_switch_result(
     })
 }
 
-fn managed_profile(settings: &BackendSettings) -> anyhow::Result<&RelayProfile> {
-    settings
+fn managed_profile(settings: &BackendSettings) -> anyhow::Result<RelayProfile> {
+    let profile = settings
         .relay_profiles
         .iter()
         .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
-        .ok_or_else(|| anyhow::anyhow!("尚未配置 U-API 服务密钥"))
+        .ok_or_else(|| anyhow::anyhow!("尚未配置 U-API 服务密钥"))?;
+    canonicalize_managed_profile(profile).context("U-API profile 无法安全重建")
 }
 
 fn managed_api_key(
@@ -861,6 +885,400 @@ fn managed_api_key(
             }
         }
     }
+}
+
+fn prepare_default_distribution_state(
+    store: &SettingsStore,
+    vault: &impl CredentialVault,
+) -> anyhow::Result<()> {
+    let home = crate::codex_home::default_codex_home_dir();
+    prepare_distribution_state_with(
+        &home,
+        store,
+        &crate::paths::default_settings_path(),
+        &crate::paths::legacy_upstream_settings_path(),
+        vault,
+    )
+}
+
+fn prepare_distribution_state_with(
+    home: &Path,
+    store: &SettingsStore,
+    isolated_settings_path: &Path,
+    legacy_settings_path: &Path,
+    vault: &impl CredentialVault,
+) -> anyhow::Result<()> {
+    crate::relay_config::with_live_files_transaction(home, || {
+        migrate_legacy_distribution_state_with(
+            store,
+            isolated_settings_path,
+            legacy_settings_path,
+            vault,
+        )
+    })
+}
+
+fn migrate_legacy_distribution_state_with(
+    store: &SettingsStore,
+    isolated_settings_path: &Path,
+    legacy_settings_path: &Path,
+    vault: &impl CredentialVault,
+) -> anyhow::Result<()> {
+    if isolated_settings_path == legacy_settings_path {
+        return Ok(());
+    }
+
+    let mut isolated = if isolated_settings_path.exists() {
+        // Never use a damaged new file as a reason to erase the only readable
+        // legacy copy. The caller will surface this error and preserve both.
+        Some(
+            store
+                .load()
+                .context("读取独立 U-API 设置失败，旧版数据未改动")?,
+        )
+    } else {
+        None
+    };
+    let isolated_has_managed_profile = isolated.as_ref().is_some_and(|settings| {
+        settings
+            .relay_profiles
+            .iter()
+            .any(|profile| canonicalize_managed_profile(profile).is_ok())
+    });
+    let legacy_has_owned_marker = legacy_settings_has_owned_marker(legacy_settings_path)?;
+    let (legacy_profiles, legacy_mode) = if legacy_has_owned_marker {
+        read_legacy_managed_profiles(legacy_settings_path)?
+    } else {
+        (Vec::new(), UapiConnectionMode::Uapi)
+    };
+    if legacy_has_owned_marker && legacy_profiles.is_empty() {
+        anyhow::bail!("检测到旧版 U-API 标记，但无法确认可安全迁移的 profile；旧版数据未改动");
+    }
+
+    let profile_to_copy = if !isolated_has_managed_profile {
+        legacy_profiles
+            .first()
+            .cloned()
+            .map(sanitize_managed_profile)
+            .transpose()?
+    } else {
+        None
+    };
+    let mut candidate_keys = Vec::new();
+    if let Some(settings) = isolated.as_ref() {
+        collect_owned_profile_keys(&settings.relay_profiles, &mut candidate_keys);
+    }
+    collect_owned_profile_keys(&legacy_profiles, &mut candidate_keys);
+    if candidate_keys.len() > 1 {
+        anyhow::bail!("独立设置与旧版共享设置中存在不同的 U-API 密钥；为避免覆盖，旧版数据未改动");
+    }
+    let credential_rollback = candidate_keys
+        .first()
+        .map(|key| reconcile_legacy_managed_api_key(vault, key))
+        .transpose()?
+        .flatten();
+
+    if let Some(profile) = profile_to_copy {
+        let isolated_settings = isolated.get_or_insert_with(BackendSettings::default);
+        if isolated_settings.relay_profiles.as_slice() == [RelayProfile::default()] {
+            isolated_settings.relay_profiles.clear();
+        }
+        upsert_managed_profile(isolated_settings, profile);
+        isolated_settings.relay_profiles_enabled = true;
+        isolated_settings.active_relay_id = match legacy_mode {
+            UapiConnectionMode::Uapi => distribution::FIXED_PROVIDER_ID.to_string(),
+            UapiConnectionMode::Official => OFFICIAL_RELAY_ID.to_string(),
+        };
+        isolated_settings.active_aggregate_relay_id.clear();
+        apply_distribution_feature_defaults(isolated_settings);
+        if let Err(save_error) = store.save(isolated_settings) {
+            if let Some(previous_credential) = credential_rollback.as_ref() {
+                restore_credential(
+                    vault,
+                    CredentialSlot::UapiApiKey,
+                    previous_credential.as_deref(),
+                )
+                .context("独立设置写入失败，且 U-API 密钥回滚失败")?;
+            }
+            return Err(save_error).context("保存独立 U-API 设置失败，旧版数据未改动");
+        }
+    } else if let Some(isolated_settings) = isolated.as_mut() {
+        migrate_legacy_managed_api_key(store, isolated_settings, vault)
+            .context("清理独立设置中的旧版 U-API 明文密钥失败，旧版数据未改动")?;
+    }
+
+    // Reading through the system vault atomically moves the encrypted
+    // U-API-owned snapshot into the isolated directory when necessary.
+    if let Err(error) = vault.get(CredentialSlot::OfficialAuthJson) {
+        // A damaged or temporarily unavailable official snapshot must not
+        // block an otherwise valid U-API profile. The vault keeps both legacy
+        // and isolated recovery paths and retries on later reads.
+        record_nonfatal_credential_error("uapi.legacy_official_auth_migration_deferred", &error);
+    }
+    if legacy_has_owned_marker {
+        remove_owned_settings_state(legacy_settings_path, false)
+            .context("清理旧版共享设置中的 U-API 数据失败")?;
+    }
+    Ok(())
+}
+
+fn legacy_settings_has_owned_marker(path: &Path) -> anyhow::Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取旧版共享设置失败：{}", path.display()));
+        }
+    };
+    if let Ok(root) = serde_json::from_slice::<Value>(&bytes) {
+        return Ok(root
+            .get("relayProfiles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(managed_profile_value_is_owned));
+    }
+
+    // A malformed shared file should block cleanup only when its raw payload
+    // still carries the complete generated transport signature. A bare ID or
+    // an unrelated field containing the U-API URL is not ownership evidence.
+    let raw = String::from_utf8_lossy(&bytes);
+    Ok(raw.contains(&format!(
+        "model_provider = \\\"{}\\\"",
+        distribution::FIXED_PROVIDER_ID
+    )) && raw.contains(&format!(
+        "[model_providers.{}]",
+        distribution::FIXED_PROVIDER_ID
+    )) && raw.contains(&format!(
+        "base_url = \\\"{}\\\"",
+        distribution::FIXED_BASE_URL
+    )) && raw.contains("wire_api = \\\"responses\\\"")
+        && raw.contains("requires_openai_auth = false"))
+}
+
+fn read_legacy_managed_profiles(
+    path: &Path,
+) -> anyhow::Result<(Vec<RelayProfile>, UapiConnectionMode)> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok((Vec::new(), UapiConnectionMode::Uapi));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取旧版共享设置失败：{}", path.display()));
+        }
+    };
+    let root = serde_json::from_str::<Value>(&contents)
+        .with_context(|| format!("旧版共享设置不是有效 JSON：{}", path.display()))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("旧版共享设置根节点不是 JSON 对象：{}", path.display()))?;
+    let mut profiles = Vec::new();
+    for profile in object
+        .get("relayProfiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|profile| managed_profile_value_is_owned(profile))
+    {
+        profiles.push(
+            serde_json::from_value::<RelayProfile>(profile.clone())
+                .context("旧版 U-API profile 包含无法迁移的字段；为避免丢失密钥，旧版数据未改动")?,
+        );
+    }
+    let mode = if object.get("activeRelayId").and_then(Value::as_str) == Some(OFFICIAL_RELAY_ID) {
+        UapiConnectionMode::Official
+    } else {
+        UapiConnectionMode::Uapi
+    };
+    Ok((profiles, mode))
+}
+
+fn collect_owned_profile_keys(profiles: &[RelayProfile], keys: &mut Vec<String>) {
+    for key in profiles
+        .iter()
+        .filter(|profile| managed_profile_is_owned(profile))
+        .map(crate::relay_config::relay_profile_api_key)
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+    {
+        if !keys.iter().any(|existing| existing == &key) {
+            keys.push(key);
+        }
+    }
+}
+
+fn collect_owned_profile_keys_from_file(path: &Path, keys: &mut Vec<String>) -> anyhow::Result<()> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取设置失败：{}", path.display()));
+        }
+    };
+    let root = serde_json::from_str::<Value>(&contents)
+        .with_context(|| format!("设置不是有效 JSON：{}", path.display()))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("设置根节点不是 JSON 对象：{}", path.display()))?;
+    for value in object
+        .get("relayProfiles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|value| managed_profile_value_is_owned(value))
+    {
+        // Prefer the typed representation so extraction follows the normal
+        // relay precedence. If an unrelated future field cannot deserialize,
+        // fall back to the legacy plaintext locations without weakening
+        // the strict ownership check above.
+        let key = serde_json::from_value::<RelayProfile>(value.clone())
+            .ok()
+            .map(|profile| crate::relay_config::relay_profile_api_key(&profile))
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| {
+                value
+                    .get("authContents")
+                    .and_then(Value::as_str)
+                    .and_then(auth_json_api_key)
+            })
+            .or_else(|| {
+                let contents = value.get("configContents")?.as_str()?;
+                let config = contents.parse::<DocumentMut>().ok()?;
+                config
+                    .get("experimental_bearer_token")
+                    .and_then(Item::as_str)
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                value
+                    .get("apiKey")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(ToString::to_string)
+            });
+        if let Some(key) = key {
+            let key = key.trim();
+            if !keys.iter().any(|existing| existing == key) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the exact previous vault value only when this call wrote the slot.
+fn reconcile_legacy_managed_api_key(
+    vault: &impl CredentialVault,
+    legacy_key: &str,
+) -> anyhow::Result<Option<Option<String>>> {
+    let legacy_key = legacy_key.trim();
+    if legacy_key.is_empty() {
+        return Ok(None);
+    }
+    let previous = vault
+        .get(CredentialSlot::UapiApiKey)
+        .context("读取系统凭证库中的 U-API 密钥失败")?;
+    if let Some(existing) = previous.as_deref().filter(|value| !value.trim().is_empty()) {
+        if existing.trim() == legacy_key {
+            return Ok(None);
+        }
+        anyhow::bail!("系统凭证库与旧版设置中的 U-API 密钥不一致；为避免覆盖，原配置已保留");
+    }
+
+    vault
+        .set(CredentialSlot::UapiApiKey, legacy_key)
+        .context("迁移旧版 U-API 密钥到系统凭证库失败")?;
+    let verification = vault
+        .get(CredentialSlot::UapiApiKey)
+        .context("校验已迁移的 U-API 密钥失败")
+        .and_then(|stored| {
+            stored
+                .is_some_and(|stored| stored.trim() == legacy_key)
+                .then_some(())
+                .ok_or_else(|| anyhow::anyhow!("U-API 密钥写入后校验不一致"))
+        });
+    if let Err(verification_error) = verification {
+        if let Err(rollback_error) =
+            restore_credential(vault, CredentialSlot::UapiApiKey, previous.as_deref())
+        {
+            anyhow::bail!("U-API 密钥写入后校验失败，且凭证库回滚失败：{rollback_error}");
+        }
+        return Err(verification_error).context("U-API 密钥写入后校验失败，原凭证库状态已恢复");
+    }
+    Ok(Some(previous))
+}
+
+fn validate_owned_settings_state(path: &Path) -> anyhow::Result<()> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取设置失败：{}", path.display()));
+        }
+    };
+    let root = serde_json::from_str::<Value>(&contents)
+        .with_context(|| format!("设置不是有效 JSON：{}", path.display()))?;
+    if !root.is_object() {
+        anyhow::bail!("设置根节点不是 JSON 对象：{}", path.display());
+    }
+    Ok(())
+}
+
+/// Removes only the fixed profile and mode selector from a settings document.
+/// Unknown and non-U-API fields are retained verbatim at the JSON value level.
+fn remove_owned_settings_state(path: &Path, isolated_uapi_settings: bool) -> anyhow::Result<bool> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("读取设置失败：{}", path.display()));
+        }
+    };
+    let mut root = serde_json::from_str::<Value>(&contents)
+        .with_context(|| format!("设置不是有效 JSON：{}", path.display()))?;
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("设置根节点不是 JSON 对象：{}", path.display()))?;
+    let mut changed = false;
+    let mut removed_managed_profile = false;
+    if let Some(profiles) = object
+        .get_mut("relayProfiles")
+        .and_then(Value::as_array_mut)
+    {
+        let before = profiles.len();
+        profiles.retain(|profile| {
+            if profile.get("id").and_then(Value::as_str) != Some(distribution::FIXED_PROVIDER_ID) {
+                return true;
+            }
+            if isolated_uapi_settings {
+                return false;
+            }
+            !managed_profile_value_is_owned(profile)
+        });
+        removed_managed_profile = profiles.len() != before;
+        changed |= removed_managed_profile;
+    }
+    let active_id = object
+        .get("activeRelayId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let active_mode_is_owned = active_id == distribution::FIXED_PROVIDER_ID
+        || active_id == OFFICIAL_RELAY_ID && (removed_managed_profile || isolated_uapi_settings);
+    if active_mode_is_owned {
+        object.insert("activeRelayId".to_string(), Value::String(String::new()));
+        changed = true;
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let bytes = serde_json::to_vec_pretty(&root).context("序列化清理后的设置失败")?;
+    crate::settings::atomic_write(path, &bytes)
+        .with_context(|| format!("保存清理后的设置失败：{}", path.display()))?;
+    Ok(true)
 }
 
 fn migrate_legacy_managed_api_key_best_effort(
@@ -888,36 +1306,44 @@ fn migrate_legacy_managed_api_key(
     settings: &mut BackendSettings,
     vault: &impl CredentialVault,
 ) -> anyhow::Result<bool> {
-    let Some(profile_index) = settings
+    let profile_indices = settings
         .relay_profiles
         .iter()
-        .position(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
-    else {
+        .enumerate()
+        .filter_map(|(index, profile)| managed_profile_is_owned(profile).then_some(index))
+        .collect::<Vec<_>>();
+    if profile_indices.is_empty() {
+        return Ok(false);
+    }
+    let mut legacy_keys = Vec::new();
+    for index in &profile_indices {
+        let key = crate::relay_config::relay_profile_api_key(&settings.relay_profiles[*index]);
+        let key = key.trim();
+        if !key.is_empty() && !legacy_keys.iter().any(|existing| existing == key) {
+            legacy_keys.push(key.to_string());
+        }
+    }
+    if legacy_keys.len() > 1 {
+        anyhow::bail!("本地设置中存在不同的旧版 U-API 明文密钥；为避免覆盖，原配置已保留");
+    }
+    let Some(legacy_key) = legacy_keys.first() else {
         return Ok(false);
     };
-    let legacy_key =
-        crate::relay_config::relay_profile_api_key(&settings.relay_profiles[profile_index]);
-    if legacy_key.trim().is_empty() {
-        return Ok(false);
-    }
 
-    let sanitized = sanitize_managed_profile(settings.relay_profiles[profile_index].clone())?;
-    let previous_credential = vault
-        .get(CredentialSlot::UapiApiKey)
-        .context("读取系统凭证库中的 U-API 密钥失败")?;
-    let needs_secure_write = previous_credential
-        .as_deref()
-        .is_none_or(|value| value.trim().is_empty());
-    if needs_secure_write {
-        vault
-            .set(CredentialSlot::UapiApiKey, legacy_key.trim())
-            .context("迁移旧版 U-API 密钥到系统凭证库失败")?;
-    }
+    // Validate every duplicate before writing the vault so a malformed later
+    // profile cannot leave a half-migrated credential behind.
+    let sanitized_profiles = profile_indices
+        .iter()
+        .map(|index| sanitize_managed_profile(settings.relay_profiles[*index].clone()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let credential_rollback = reconcile_legacy_managed_api_key(vault, legacy_key)?;
 
     let mut sanitized_settings = settings.clone();
-    sanitized_settings.relay_profiles[profile_index] = sanitized;
+    for (index, sanitized) in profile_indices.into_iter().zip(sanitized_profiles) {
+        sanitized_settings.relay_profiles[index] = sanitized;
+    }
     if let Err(save_error) = store.save(&sanitized_settings) {
-        if needs_secure_write {
+        if let Some(previous_credential) = credential_rollback.as_ref() {
             if let Err(restore_error) = restore_credential(
                 vault,
                 CredentialSlot::UapiApiKey,
@@ -943,7 +1369,7 @@ fn stored_managed_api_key(
     let legacy_key = settings
         .relay_profiles
         .iter()
-        .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        .find(|profile| managed_profile_is_owned(profile))
         .map(crate::relay_config::relay_profile_api_key)
         .filter(|key| !key.trim().is_empty());
     let api_key = match vault.get(CredentialSlot::UapiApiKey) {
@@ -1046,12 +1472,460 @@ fn clear_managed_config_for_official_locked(
     Ok(result)
 }
 
-fn sanitize_managed_profile(mut profile: RelayProfile) -> anyhow::Result<RelayProfile> {
-    profile.api_key.clear();
-    profile.auth_contents.clear();
-    profile.vlm_api_key.clear();
-    crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
-    Ok(profile)
+fn managed_profile_is_owned(profile: &RelayProfile) -> bool {
+    if profile.id != distribution::FIXED_PROVIDER_ID
+        || profile.protocol != RelayProtocol::Responses
+        || profile.relay_mode != RelayMode::PureApi
+    {
+        return false;
+    }
+    managed_config_is_owned(&profile.config_contents)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedProfileOwnershipView {
+    id: String,
+    #[serde(default)]
+    protocol: RelayProtocol,
+    #[serde(rename = "relayMode", default)]
+    relay_mode: RelayMode,
+    #[serde(rename = "configContents", default)]
+    config_contents: String,
+}
+
+fn managed_profile_value_is_owned(value: &Value) -> bool {
+    let Ok(profile) = serde_json::from_value::<ManagedProfileOwnershipView>(value.clone()) else {
+        return false;
+    };
+    profile.id == distribution::FIXED_PROVIDER_ID
+        && profile.protocol == RelayProtocol::Responses
+        && profile.relay_mode == RelayMode::PureApi
+        && managed_config_is_owned(&profile.config_contents)
+}
+
+fn managed_config_is_owned(config_contents: &str) -> bool {
+    let Ok(config) = config_contents.parse::<DocumentMut>() else {
+        return false;
+    };
+    if config.get("model_provider").and_then(Item::as_str) != Some(distribution::FIXED_PROVIDER_ID)
+    {
+        return false;
+    }
+    let Some(provider) = config
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(distribution::FIXED_PROVIDER_ID))
+        .and_then(Item::as_table_like)
+    else {
+        return false;
+    };
+    managed_provider_table_is_owned(provider)
+}
+
+fn managed_provider_table_is_owned(provider: &dyn TableLike) -> bool {
+    provider
+        .get("base_url")
+        .and_then(Item::as_str)
+        .is_some_and(|url| normalize_base_url(url) == distribution::FIXED_BASE_URL)
+        && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
+        && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(false)
+}
+
+/// Rebuilds the persisted managed profile from the only data users are allowed
+/// to influence: discovered model identifiers and the selected model. This is
+/// deliberately stricter than generic relay normalization, because accepting a
+/// syntactically valid but modified provider table could send the U-API key to
+/// an attacker-controlled endpoint during the next launch.
+fn canonicalize_managed_profile(profile: &RelayProfile) -> anyhow::Result<RelayProfile> {
+    if !managed_profile_is_owned(profile) {
+        anyhow::bail!("U-API profile 的固定供应商配置已损坏或被修改");
+    }
+    let config = profile
+        .config_contents
+        .parse::<DocumentMut>()
+        .context("U-API profile 配置格式无效")?;
+    let selected_model = config
+        .get("model")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|model| valid_model_id(model))
+        .or_else(|| {
+            let model = profile.model.trim();
+            valid_model_id(model).then_some(model)
+        });
+    let mut seen = HashSet::new();
+    let mut models = profile
+        .model_list
+        .split(['\r', '\n', ','])
+        .map(str::trim)
+        .filter(|model| valid_model_id(model))
+        .filter(|model| seen.insert(model.to_ascii_lowercase()))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if let Some(selected_model) = selected_model
+        && seen.insert(selected_model.to_ascii_lowercase())
+    {
+        models.push(selected_model.to_string());
+    }
+    if models.is_empty() {
+        anyhow::bail!("U-API profile 没有可用的模型");
+    }
+    models.sort_by(|left, right| compare_model_priority(left, right));
+    let selected_model = selected_model
+        .and_then(|selected| {
+            models
+                .iter()
+                .find(|model| model.eq_ignore_ascii_case(selected))
+                .cloned()
+        })
+        .or_else(|| choose_model(&models, std::iter::empty::<&String>()))
+        .ok_or_else(|| anyhow::anyhow!("U-API profile 没有可用的默认模型"))?;
+    build_managed_profile(&selected_model, &models)
+}
+
+fn sanitize_managed_profile(profile: RelayProfile) -> anyhow::Result<RelayProfile> {
+    canonicalize_managed_profile(&profile)
+}
+
+fn uninstall_cleanup_with(
+    isolated_settings_path: &Path,
+    legacy_settings_path: &Path,
+    home: &Path,
+    vault: &impl CredentialVault,
+) -> anyhow::Result<()> {
+    uninstall_cleanup_with_failure(
+        isolated_settings_path,
+        legacy_settings_path,
+        home,
+        vault,
+        None,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UninstallFailurePoint {
+    AfterIsolatedSettingsCleanup,
+    AfterCatalogCleanup,
+}
+
+fn uninstall_cleanup_with_failure(
+    isolated_settings_path: &Path,
+    legacy_settings_path: &Path,
+    home: &Path,
+    vault: &impl CredentialVault,
+    failure_point: Option<UninstallFailurePoint>,
+) -> anyhow::Result<()> {
+    // Validate both settings documents before deleting any credential. A
+    // damaged file must remain untouched and must keep the uninstaller around
+    // so the user can repair or retry instead of silently losing data.
+    validate_owned_settings_state(isolated_settings_path)?;
+    let legacy_has_owned_marker = legacy_settings_path != isolated_settings_path
+        && legacy_settings_has_owned_marker(legacy_settings_path)?;
+    if legacy_has_owned_marker {
+        validate_owned_settings_state(legacy_settings_path)?;
+    }
+    let mut owned_api_keys = Vec::new();
+    for path in [isolated_settings_path, legacy_settings_path] {
+        if path == legacy_settings_path && !legacy_has_owned_marker {
+            continue;
+        }
+        collect_owned_profile_keys_from_file(path, &mut owned_api_keys)
+            .context("读取卸载前 U-API profile 密钥失败")?;
+    }
+
+    crate::relay_config::with_live_files_transaction(home, || {
+        let live_snapshot =
+            UapiLiveFilesSnapshot::capture(home).context("读取卸载前 Codex 实时配置快照失败")?;
+        let settings_snapshot =
+            SettingsFilesSnapshot::capture(isolated_settings_path, legacy_settings_path)
+                .context("读取卸载前 U-API 设置快照失败")?;
+        let credential_snapshot = CredentialSnapshot::capture_for_uninstall(vault)
+            .context("读取卸载前 U-API 凭证快照失败")?;
+
+        let cleanup_result = (|| {
+            cleanup_live_uapi_projection_locked(home, &credential_snapshot, &owned_api_keys)?;
+
+            remove_owned_settings_state(isolated_settings_path, true)
+                .context("删除独立设置中的 U-API profile 失败")?;
+            fail_uninstall_if_requested(
+                failure_point,
+                UninstallFailurePoint::AfterIsolatedSettingsCleanup,
+            )?;
+            if legacy_has_owned_marker {
+                remove_owned_settings_state(legacy_settings_path, false)
+                    .context("删除旧版共享设置中的 U-API profile 失败")?;
+            }
+
+            ensure_managed_catalog_is_not_referenced(home)?;
+            remove_file_if_present(&managed_catalog_path(home))
+                .context("删除 U-API 受管模型目录失败")?;
+            fail_uninstall_if_requested(failure_point, UninstallFailurePoint::AfterCatalogCleanup)?;
+
+            // Credentials are the least recoverable part of the transaction,
+            // so delete them only after every file mutation has succeeded.
+            vault
+                .delete(CredentialSlot::UapiApiKey)
+                .context("删除系统凭证库中的 U-API 密钥失败")?;
+            vault
+                .delete(CredentialSlot::OfficialAuthJson)
+                .context("删除 U-API 加密官方登录快照失败")?;
+            Ok(())
+        })();
+
+        match cleanup_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let credential_restore_error = credential_snapshot.restore(vault).err();
+                let settings_restore_error = settings_snapshot
+                    .restore(isolated_settings_path, legacy_settings_path)
+                    .err();
+                let live_restore_error = live_snapshot.restore(home).err();
+                if credential_restore_error.is_some()
+                    || settings_restore_error.is_some()
+                    || live_restore_error.is_some()
+                {
+                    anyhow::bail!(
+                        "卸载前清理失败，且自动回滚不完整：清理={error}，系统凭证库={}，设置={}，Codex 文件={}",
+                        rollback_status(credential_restore_error),
+                        rollback_status(settings_restore_error),
+                        rollback_status(live_restore_error),
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+}
+
+fn fail_uninstall_if_requested(
+    requested: Option<UninstallFailurePoint>,
+    current: UninstallFailurePoint,
+) -> anyhow::Result<()> {
+    if requested == Some(current) {
+        anyhow::bail!("simulated uninstall cleanup failure at {current:?}");
+    }
+    Ok(())
+}
+
+fn cleanup_live_uapi_projection_locked(
+    home: &Path,
+    credential_snapshot: &CredentialSnapshot,
+    owned_api_keys: &[String],
+) -> anyhow::Result<()> {
+    let config_path = home.join("config.toml");
+    let config_contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("读取 Codex 实时配置失败"),
+    };
+    let mut config = config_contents
+        .as_deref()
+        .map(str::parse::<DocumentMut>)
+        .transpose()
+        .context("Codex 实时 config.toml 已损坏，拒绝在卸载时覆盖")?;
+
+    let mut active_owned = false;
+    let mut provider_owned = false;
+    let mut config_changed = false;
+    if let Some(document) = config.as_mut() {
+        provider_owned = document
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(distribution::FIXED_PROVIDER_ID))
+            .and_then(Item::as_table_like)
+            .is_some_and(managed_provider_table_is_owned);
+        active_owned = provider_owned
+            && document.get("model_provider").and_then(Item::as_str)
+                == Some(distribution::FIXED_PROVIDER_ID);
+        let catalog_owned = document
+            .get("model_catalog_json")
+            .and_then(Item::as_str)
+            .is_some_and(|path| managed_catalog_pointer_matches(home, path));
+
+        if active_owned {
+            document.as_table_mut().remove("model_provider");
+            document.as_table_mut().remove("model");
+            config_changed = true;
+        }
+        if catalog_owned {
+            document.as_table_mut().remove("model_catalog_json");
+            config_changed = true;
+        }
+        if provider_owned {
+            let providers_empty = document
+                .get_mut("model_providers")
+                .and_then(Item::as_table_mut)
+                .map(|providers| {
+                    providers.remove(distribution::FIXED_PROVIDER_ID);
+                    providers.is_empty()
+                })
+                .unwrap_or(false);
+            if providers_empty {
+                document.as_table_mut().remove("model_providers");
+            }
+            config_changed = true;
+        }
+    }
+
+    let stored_uapi_key = match &credential_snapshot.uapi_api_key {
+        CapturedCredential::Present(key) => Some(key.as_str()),
+        CapturedCredential::Unchanged | CapturedCredential::Missing => None,
+    }
+    .filter(|key| !key.trim().is_empty());
+    let live_auth_path = home.join("auth.json");
+    let (live_auth_contents, live_auth_missing) = match std::fs::read_to_string(&live_auth_path) {
+        Ok(contents) => (Some(contents), false),
+        Err(error) if error.kind() == ErrorKind::NotFound => (None, true),
+        // Invalid UTF-8 and other unreadable states are not proof of ownership.
+        // The outer byte snapshot will still preserve or roll back the file.
+        Err(_) => (None, false),
+    };
+    let live_auth_is_official = live_auth_contents
+        .as_deref()
+        .is_some_and(official_auth_contents_are_valid);
+    let live_auth_key = live_auth_contents.as_deref().and_then(auth_json_api_key);
+    let matching_owned_key = live_auth_key.as_deref().and_then(|live_key| {
+        stored_uapi_key
+            .as_deref()
+            .filter(|key| key.trim() == live_key)
+            .or_else(|| {
+                owned_api_keys
+                    .iter()
+                    .map(String::as_str)
+                    .find(|key| key.trim() == live_key)
+            })
+    });
+    let auth_bytes = if active_owned {
+        let stored_official_auth = match &credential_snapshot.official_auth_json {
+            CapturedCredential::Present(contents) if official_auth_contents_are_valid(contents) => {
+                Some(contents.as_str())
+            }
+            CapturedCredential::Unchanged
+            | CapturedCredential::Missing
+            | CapturedCredential::Present(_) => None,
+        };
+        if live_auth_is_official {
+            None
+        } else if let Some(matching_owned_key) = matching_owned_key {
+            if let Some(contents) = stored_official_auth {
+                Some(contents.as_bytes().to_vec())
+            } else {
+                remove_live_uapi_key_from_auth(home, matching_owned_key)?
+            }
+        } else if live_auth_missing {
+            stored_official_auth.map(|contents| contents.as_bytes().to_vec())
+        } else {
+            None
+        }
+    } else if provider_owned {
+        if let Some(matching_owned_key) = matching_owned_key {
+            remove_live_uapi_key_from_auth(home, matching_owned_key)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if !config_changed && auth_bytes.is_none() {
+        return Ok(());
+    }
+
+    let snapshot =
+        UapiLiveFilesSnapshot::capture(home).context("读取卸载前 Codex 实时配置快照失败")?;
+    let result = (|| {
+        if config_changed {
+            let contents = config.as_ref().map(ToString::to_string).unwrap_or_default();
+            crate::settings::atomic_write(&config_path, contents.as_bytes())
+                .context("清理 Codex 实时 U-API 配置失败")?;
+        }
+        if let Some(auth_bytes) = auth_bytes.as_deref() {
+            crate::settings::atomic_write_private(&home.join("auth.json"), auth_bytes)
+                .context("恢复 Codex 官方登录信息失败")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if let Err(rollback_error) = snapshot.restore(home) {
+            anyhow::bail!(
+                "卸载前清理失败，且实时配置回滚不完整：清理={error}，回滚={rollback_error}"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn remove_live_uapi_key_from_auth(
+    home: &Path,
+    expected_key: &str,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let auth_path = home.join("auth.json");
+    let contents = match std::fs::read_to_string(&auth_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("读取 Codex 实时 auth.json 失败"),
+    };
+    let mut value = serde_json::from_str::<Value>(&contents)
+        .context("Codex 实时 auth.json 已损坏，拒绝在卸载时覆盖")?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Codex 实时 auth.json 根节点不是 JSON 对象"))?;
+    let matches = object
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.trim() == expected_key.trim());
+    if !matches {
+        return Ok(None);
+    }
+    if object.remove("OPENAI_API_KEY").is_none() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_vec_pretty(&value)?))
+}
+
+fn managed_catalog_pointer_matches(home: &Path, pointer: &str) -> bool {
+    let normalized = pointer.trim().replace('\\', "/");
+    let relative = normalized.trim_start_matches("./");
+    let expected_relative =
+        crate::relay_config::managed_model_catalog_relative_path(distribution::FIXED_PROVIDER_ID)
+            .replace('\\', "/");
+    if relative.eq_ignore_ascii_case(&expected_relative) {
+        return true;
+    }
+    let expected_absolute = managed_catalog_path(home)
+        .to_string_lossy()
+        .replace('\\', "/");
+    normalized.eq_ignore_ascii_case(&expected_absolute)
+}
+
+fn ensure_managed_catalog_is_not_referenced(home: &Path) -> anyhow::Result<()> {
+    let config_path = home.join("config.toml");
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("检查 Codex 模型目录引用失败"),
+    };
+    let document = contents
+        .parse::<DocumentMut>()
+        .context("Codex 实时 config.toml 已损坏，拒绝删除可能仍在使用的模型目录")?;
+    if document
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .is_some_and(|path| managed_catalog_pointer_matches(home, path))
+    {
+        anyhow::bail!("Codex 实时配置仍引用 U-API 模型目录，拒绝删除");
+    }
+    Ok(())
+}
+
+fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn preserve_legacy_key_in_profile(
@@ -1132,7 +2006,8 @@ fn commit_connection_change_locked<F>(
 where
     F: FnOnce() -> anyhow::Result<crate::relay_config::RelayApplyResult>,
 {
-    let original_settings = store.load().context("读取原始本地设置失败")?;
+    let original_settings_bytes = store.snapshot_bytes().context("读取原始本地设置快照失败")?;
+    store.load().context("读取原始本地设置失败")?;
     let live_snapshot =
         UapiLiveFilesSnapshot::capture(home).context("读取当前 Codex 实时配置失败")?;
     let credential_snapshot =
@@ -1153,7 +2028,9 @@ where
     match result {
         Ok(result) => Ok(result),
         Err(error) => {
-            let settings_restore_error = store.save(&original_settings).err();
+            let settings_restore_error = store
+                .restore_bytes(original_settings_bytes.as_deref())
+                .err();
             let live_restore_error = live_snapshot.restore(home).err();
             let credential_restore_error = credential_snapshot.restore(vault).err();
             if settings_restore_error.is_some()
@@ -1215,6 +2092,49 @@ impl UapiLiveFilesSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SettingsFilesSnapshot {
+    isolated: Option<Vec<u8>>,
+    legacy: CapturedFile,
+}
+
+#[derive(Debug, Clone)]
+enum CapturedFile {
+    SameAsIsolated,
+    Contents(Option<Vec<u8>>),
+}
+
+impl SettingsFilesSnapshot {
+    fn capture(isolated_path: &Path, legacy_path: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            isolated: read_optional_bytes(isolated_path)?,
+            legacy: if isolated_path == legacy_path {
+                CapturedFile::SameAsIsolated
+            } else {
+                CapturedFile::Contents(read_optional_bytes(legacy_path)?)
+            },
+        })
+    }
+
+    fn restore(&self, isolated_path: &Path, legacy_path: &Path) -> anyhow::Result<()> {
+        let isolated_error = restore_optional_file(isolated_path, self.isolated.as_deref()).err();
+        let legacy_error = match &self.legacy {
+            CapturedFile::SameAsIsolated => None,
+            CapturedFile::Contents(contents) => {
+                restore_optional_file(legacy_path, contents.as_deref()).err()
+            }
+        };
+        if isolated_error.is_none() && legacy_error.is_none() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "设置文件回滚不完整：独立设置={}，旧版共享设置={}",
+            rollback_status(isolated_error),
+            rollback_status(legacy_error),
+        )
+    }
+}
+
 fn managed_catalog_path(home: &Path) -> std::path::PathBuf {
     home.join("model-catalogs")
         .join(format!("{}.json", distribution::FIXED_PROVIDER_ID))
@@ -1251,6 +2171,10 @@ impl CredentialSnapshot {
                 capture_official_auth_json,
             )?,
         })
+    }
+
+    fn capture_for_uninstall(vault: &impl CredentialVault) -> anyhow::Result<Self> {
+        Self::capture(vault, true, true)
     }
 
     fn restore(&self, vault: &impl CredentialVault) -> anyhow::Result<()> {
@@ -1458,8 +2382,9 @@ fn read_live_managed_state(home: &Path) -> LiveManagedState {
         .and_then(|provider| provider.get("base_url"))
         .and_then(Item::as_str)
         .is_some_and(|url| normalize_base_url(url) == distribution::FIXED_BASE_URL);
+    let provider_owned = provider.is_some_and(managed_provider_table_is_owned);
     LiveManagedState {
-        provider_matches: provider_id == distribution::FIXED_PROVIDER_ID && provider.is_some(),
+        provider_matches: provider_id == distribution::FIXED_PROVIDER_ID && provider_owned,
         base_url_matches,
         model: doc
             .get("model")
@@ -1686,6 +2611,47 @@ mod tests {
     use super::credentials::testing::MemoryCredentialVault;
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct SingleReadCredentialVault {
+        secrets: std::sync::Mutex<std::collections::HashMap<CredentialSlot, String>>,
+        reads: std::sync::Mutex<std::collections::HashMap<CredentialSlot, usize>>,
+    }
+
+    impl SingleReadCredentialVault {
+        fn read_count(&self, slot: CredentialSlot) -> usize {
+            *self.reads.lock().unwrap().get(&slot).unwrap_or(&0)
+        }
+
+        fn peek(&self, slot: CredentialSlot) -> Option<String> {
+            self.secrets.lock().unwrap().get(&slot).cloned()
+        }
+    }
+
+    impl CredentialVault for SingleReadCredentialVault {
+        fn get(&self, slot: CredentialSlot) -> anyhow::Result<Option<String>> {
+            let mut reads = self.reads.lock().unwrap();
+            let count = reads.entry(slot).or_default();
+            *count += 1;
+            if *count > 1 {
+                anyhow::bail!("simulated credential read failure after first read");
+            }
+            Ok(self.secrets.lock().unwrap().get(&slot).cloned())
+        }
+
+        fn set(&self, slot: CredentialSlot, secret: &str) -> anyhow::Result<()> {
+            self.secrets
+                .lock()
+                .unwrap()
+                .insert(slot, secret.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, slot: CredentialSlot) -> anyhow::Result<()> {
+            self.secrets.lock().unwrap().remove(&slot);
+            Ok(())
+        }
+    }
+
     fn discovery(models: &[&str]) -> UapiModelDiscovery {
         UapiModelDiscovery {
             endpoint: "https://example.test/v1/models".to_string(),
@@ -1868,6 +2834,153 @@ mod tests {
     }
 
     #[test]
+    fn managed_profile_ownership_requires_fixed_transport_contract() {
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        assert!(managed_profile_is_owned(&managed));
+
+        let mut foreign_endpoint = managed.clone();
+        foreign_endpoint.config_contents = foreign_endpoint
+            .config_contents
+            .replace(distribution::FIXED_BASE_URL, "https://foreign.example/v1");
+        assert!(!managed_profile_is_owned(&foreign_endpoint));
+
+        let mut wrong_protocol = managed.clone();
+        wrong_protocol.protocol = RelayProtocol::ChatCompletions;
+        assert!(!managed_profile_is_owned(&wrong_protocol));
+
+        let mut wrong_mode = managed.clone();
+        wrong_mode.relay_mode = RelayMode::MixedApi;
+        assert!(!managed_profile_is_owned(&wrong_mode));
+
+        let mut missing_provider_table = managed;
+        missing_provider_table.config_contents =
+            "model = \"gpt-5-codex\"\nmodel_provider = \"uapi_connect\"\n".to_string();
+        assert!(!managed_profile_is_owned(&missing_provider_table));
+
+        let mut wrong_wire =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        wrong_wire.config_contents = wrong_wire
+            .config_contents
+            .replace("wire_api = \"responses\"", "wire_api = \"chat\"");
+        assert!(!managed_profile_is_owned(&wrong_wire));
+
+        let mut requires_openai_auth =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        requires_openai_auth.config_contents = requires_openai_auth.config_contents.replace(
+            "requires_openai_auth = false",
+            "requires_openai_auth = true",
+        );
+        assert!(!managed_profile_is_owned(&requires_openai_auth));
+    }
+
+    #[test]
+    fn canonical_profile_rebuild_discards_untrusted_config_and_secret_fields() {
+        let mut profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        profile.config_contents.push_str(
+            "\n[model_providers.untrusted]\nbase_url = \"https://foreign.example/v1\"\nexperimental_bearer_token = \"test-untrusted-key-value\"\n",
+        );
+        profile.auth_contents = r#"{"OPENAI_API_KEY":"test-legacy-profile-key"}"#.to_string();
+        profile.upstream_base_url = "https://foreign.example/v1".to_string();
+
+        let canonical = canonicalize_managed_profile(&profile).unwrap();
+
+        assert!(managed_profile_is_owned(&canonical));
+        assert!(!canonical.config_contents.contains("untrusted"));
+        assert!(!canonical.config_contents.contains("foreign.example"));
+        assert!(
+            !canonical
+                .config_contents
+                .contains("experimental_bearer_token")
+        );
+        assert!(canonical.auth_contents.is_empty());
+        assert!(!canonical.upstream_base_url.contains("foreign.example"));
+    }
+
+    #[test]
+    fn tampered_or_damaged_profile_is_never_ready_or_applied_on_launch() {
+        for config_kind in ["tampered-endpoint", "damaged-toml"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            std::fs::create_dir_all(&home).unwrap();
+            let original_config = "model = \"user-model\"\n";
+            let original_auth = r#"{"OPENAI_API_KEY":"user-owned-key"}"#;
+            std::fs::write(home.join("config.toml"), original_config).unwrap();
+            std::fs::write(home.join("auth.json"), original_auth).unwrap();
+            let store = SettingsStore::new(temp.path().join("settings.json"));
+            let mut profile =
+                build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+            profile.config_contents = if config_kind == "tampered-endpoint" {
+                profile
+                    .config_contents
+                    .replace(distribution::FIXED_BASE_URL, "https://foreign.example/v1")
+            } else {
+                "model = [damaged toml".to_string()
+            };
+            store
+                .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+                .unwrap();
+            let vault = MemoryCredentialVault::default();
+            vault
+                .set(CredentialSlot::UapiApiKey, "test-uapi-vault-key-012345")
+                .unwrap();
+
+            let status = status_from_home_with_vault(&home, &store, &vault);
+            assert!(!status.uapi_ready, "{config_kind}");
+            assert!(!status.configured, "{config_kind}");
+            assert!(
+                apply_active_connection_profile_with(&store, &home, &vault).is_err(),
+                "{config_kind}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("config.toml")).unwrap(),
+                original_config,
+                "{config_kind}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("auth.json")).unwrap(),
+                original_auth,
+                "{config_kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_same_id_foreign_profile_is_not_migrated_or_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        store.save(&BackendSettings::default()).unwrap();
+        let mut foreign =
+            build_managed_profile("foreign-model", &["foreign-model".to_string()]).unwrap();
+        foreign.name = "User-owned same-name provider".to_string();
+        foreign.config_contents = foreign
+            .config_contents
+            .replace(distribution::FIXED_BASE_URL, "https://foreign.example/v1");
+        foreign.auth_contents = r#"{"OPENAI_API_KEY":"test-user-owned-foreign-key"}"#.to_string();
+        let legacy_bytes = serde_json::to_vec_pretty(&json!({
+            "upstreamOnly": true,
+            "relayProfiles": [serde_json::to_value(foreign).unwrap()],
+            "activeRelayId": distribution::FIXED_PROVIDER_ID,
+        }))
+        .unwrap();
+        std::fs::write(&legacy_path, &legacy_bytes).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+            .unwrap();
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+    }
+
+    #[test]
     fn upsert_preserves_unrelated_profiles() {
         let mut settings = BackendSettings::default();
         settings.relay_profiles.push(RelayProfile {
@@ -1922,6 +3035,495 @@ mod tests {
                 .auth_contents
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn duplicate_isolated_profiles_with_the_same_key_are_all_sanitized() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let store = SettingsStore::new(settings_path.clone());
+        let mut settings = BackendSettings::default();
+        for model in ["gpt-5-codex", "gpt-5.6-sol"] {
+            let mut profile = build_managed_profile(model, &[model.to_string()]).unwrap();
+            profile.auth_contents =
+                r#"{"OPENAI_API_KEY":"test-duplicate-legacy-key-012345"}"#.to_string();
+            settings.relay_profiles.push(profile);
+        }
+        store.save(&settings).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        assert!(migrate_legacy_managed_api_key(&store, &mut settings, &vault).unwrap());
+
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-duplicate-legacy-key-012345")
+        );
+        assert!(
+            settings
+                .relay_profiles
+                .iter()
+                .all(|profile| profile.auth_contents.is_empty())
+        );
+        assert!(
+            !std::fs::read_to_string(settings_path)
+                .unwrap()
+                .contains("test-duplicate-legacy-key-012345")
+        );
+    }
+
+    #[test]
+    fn legacy_config_bearer_token_is_not_rehydrated_into_persisted_auth_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let store = SettingsStore::new(settings_path.clone());
+        let mut settings = BackendSettings::default();
+        let mut profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        profile
+            .config_contents
+            .push_str("experimental_bearer_token = \"test-uapi-key-legacy-config\"\n");
+        settings.relay_profiles.push(profile);
+        std::fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        let migrated = migrate_legacy_managed_api_key(&store, &mut settings, &vault).unwrap();
+
+        assert!(migrated);
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-uapi-key-legacy-config")
+        );
+        let persisted = std::fs::read_to_string(settings_path).unwrap();
+        assert!(!persisted.contains("test-uapi-key-legacy-config"));
+        let managed = settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+            .unwrap();
+        assert!(managed.api_key.is_empty());
+        assert!(managed.auth_contents.is_empty());
+        assert!(
+            !managed
+                .config_contents
+                .contains("experimental_bearer_token")
+        );
+    }
+
+    #[test]
+    fn shared_legacy_settings_migration_only_moves_owned_uapi_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        let mut preexisting_isolated = BackendSettings::default();
+        preexisting_isolated.codex_extra_args = vec!["--isolated-setting".to_string()];
+        store.save(&preexisting_isolated).unwrap();
+        let mut managed =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        managed
+            .config_contents
+            .push_str("experimental_bearer_token = \"test-uapi-key-shared-legacy\"\n");
+        let unrelated = RelayProfile {
+            id: "upstream-profile".to_string(),
+            name: "Upstream profile".to_string(),
+            ..RelayProfile::default()
+        };
+        let legacy = json!({
+            "codexAppPath": "/Applications/Upstream Codex.app",
+            "upstreamOnly": {"keep": true},
+            "relayProfiles": [
+                serde_json::to_value(unrelated).unwrap(),
+                serde_json::to_value(managed).unwrap()
+            ],
+            "activeRelayId": distribution::FIXED_PROVIDER_ID,
+        });
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+            .unwrap();
+
+        let isolated = store.load().unwrap();
+        assert_eq!(isolated.relay_profiles.len(), 1);
+        assert_eq!(
+            isolated.relay_profiles[0].id,
+            distribution::FIXED_PROVIDER_ID
+        );
+        assert!(isolated.relay_profiles[0].auth_contents.is_empty());
+        assert!(
+            !isolated.relay_profiles[0]
+                .config_contents
+                .contains("experimental_bearer_token")
+        );
+        assert_ne!(isolated.codex_app_path, "/Applications/Upstream Codex.app");
+        assert_eq!(isolated.codex_extra_args, ["--isolated-setting"]);
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-uapi-key-shared-legacy")
+        );
+        let legacy_after: Value =
+            serde_json::from_str(&std::fs::read_to_string(legacy_path).unwrap()).unwrap();
+        assert_eq!(legacy_after["upstreamOnly"]["keep"], true);
+        assert_eq!(
+            legacy_after["codexAppPath"],
+            "/Applications/Upstream Codex.app"
+        );
+        assert_eq!(legacy_after["relayProfiles"].as_array().unwrap().len(), 1);
+        assert_eq!(legacy_after["relayProfiles"][0]["id"], "upstream-profile");
+        assert_eq!(legacy_after["activeRelayId"], "");
+    }
+
+    #[test]
+    fn isolated_profile_migrates_legacy_key_before_shared_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        let isolated_profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(
+                isolated_profile,
+                UapiConnectionMode::Uapi,
+            ))
+            .unwrap();
+        let mut legacy_profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        legacy_profile.auth_contents =
+            r#"{"OPENAI_API_KEY":"test-shared-legacy-key-012345"}"#.to_string();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [serde_json::to_value(legacy_profile).unwrap()],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+                "unrelated": "keep"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+            .unwrap();
+
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-shared-legacy-key-012345")
+        );
+        let legacy_after: Value =
+            serde_json::from_slice(&std::fs::read(&legacy_path).unwrap()).unwrap();
+        assert!(legacy_after["relayProfiles"].as_array().unwrap().is_empty());
+        assert_eq!(legacy_after["unrelated"], "keep");
+    }
+
+    #[test]
+    fn distribution_migration_waits_for_the_cross_process_transaction_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let mut legacy_profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        legacy_profile.auth_contents =
+            r#"{"OPENAI_API_KEY":"test-serialized-migration-key"}"#.to_string();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [serde_json::to_value(legacy_profile).unwrap()],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held_home = home.clone();
+        let holder = std::thread::spawn(move || {
+            crate::relay_config::with_live_files_transaction(&held_home, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker_home = home.clone();
+        let worker_isolated = isolated_path.clone();
+        let worker_legacy = legacy_path.clone();
+        let worker = std::thread::spawn(move || {
+            let store = SettingsStore::new(worker_isolated.clone());
+            let vault = MemoryCredentialVault::default();
+            let result = prepare_distribution_state_with(
+                &worker_home,
+                &store,
+                &worker_isolated,
+                &worker_legacy,
+                &vault,
+            );
+            finished_tx.send((result, vault)).unwrap();
+        });
+
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!isolated_path.exists());
+        assert!(legacy_path.exists());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap().unwrap();
+        let (result, vault) = finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        result.unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-serialized-migration-key")
+        );
+        assert!(isolated_path.exists());
+        let legacy_after: Value =
+            serde_json::from_slice(&std::fs::read(legacy_path).unwrap()).unwrap();
+        assert!(legacy_after["relayProfiles"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflicting_vault_and_legacy_keys_preserve_shared_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        let isolated_profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(
+                isolated_profile,
+                UapiConnectionMode::Uapi,
+            ))
+            .unwrap();
+        let isolated_before = std::fs::read(&isolated_path).unwrap();
+        let mut legacy_profile =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        legacy_profile.auth_contents = r#"{"OPENAI_API_KEY":"test-shared-key-012345"}"#.to_string();
+        let legacy_before = serde_json::to_vec_pretty(&json!({
+            "relayProfiles": [serde_json::to_value(legacy_profile).unwrap()],
+            "activeRelayId": distribution::FIXED_PROVIDER_ID,
+        }))
+        .unwrap();
+        std::fs::write(&legacy_path, &legacy_before).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-isolated-key-987654")
+            .unwrap();
+
+        let error =
+            migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("不一致"));
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+        assert_eq!(std::fs::read(&isolated_path).unwrap(), isolated_before);
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-isolated-key-987654")
+        );
+    }
+
+    #[test]
+    fn different_keys_in_duplicate_legacy_profiles_block_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        let mut first = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        first.auth_contents = r#"{"OPENAI_API_KEY":"test-first-key-012345"}"#.to_string();
+        let mut second =
+            build_managed_profile("gpt-5.6-sol", &["gpt-5.6-sol".to_string()]).unwrap();
+        second.auth_contents = r#"{"OPENAI_API_KEY":"test-second-key-987654"}"#.to_string();
+        let legacy_before = serde_json::to_vec_pretty(&json!({
+            "relayProfiles": [
+                serde_json::to_value(first).unwrap(),
+                serde_json::to_value(second).unwrap()
+            ],
+            "activeRelayId": distribution::FIXED_PROVIDER_ID,
+        }))
+        .unwrap();
+        std::fs::write(&legacy_path, &legacy_before).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        let error =
+            migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("不同的 U-API 密钥"));
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+        assert!(!isolated_path.exists());
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+    }
+
+    #[test]
+    fn typed_corruption_in_owned_legacy_profile_blocks_migration_without_hiding_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated").join("settings.json");
+        let legacy_path = temp.path().join("shared").join("settings.json");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let store = SettingsStore::new(isolated_path.clone());
+        let mut profile = serde_json::to_value(
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap(),
+        )
+        .unwrap();
+        profile["authContents"] =
+            Value::String(r#"{"OPENAI_API_KEY":"test-corrupt-profile-key-012345"}"#.into());
+        profile["hideOfficialUsageAlert"] = json!({"invalid": true});
+        let legacy_before = serde_json::to_vec_pretty(&json!({
+            "relayProfiles": [profile],
+            "activeRelayId": distribution::FIXED_PROVIDER_ID,
+        }))
+        .unwrap();
+        std::fs::write(&legacy_path, &legacy_before).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        assert!(legacy_settings_has_owned_marker(&legacy_path).unwrap());
+        let error =
+            migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("无法迁移"));
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+        assert!(!isolated_path.exists());
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+    }
+
+    #[test]
+    fn uninstall_removes_owned_legacy_secret_even_when_unrelated_field_type_is_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        let mut legacy_profile = serde_json::to_value(managed).unwrap();
+        legacy_profile["authContents"] =
+            Value::String(r#"{"OPENAI_API_KEY":"test-corrupt-profile-key-012345"}"#.into());
+        legacy_profile["modelWindows"] = json!({"invalid": true});
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [legacy_profile],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+                "unrelated": "keep"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-vault-key-012345")
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        let legacy_after: Value =
+            serde_json::from_slice(&std::fs::read(&legacy_path).unwrap()).unwrap();
+        assert!(legacy_after["relayProfiles"].as_array().unwrap().is_empty());
+        assert_eq!(legacy_after["unrelated"], "keep");
+        assert!(
+            !std::fs::read_to_string(&legacy_path)
+                .unwrap()
+                .contains("test-corrupt-profile-key-012345")
+        );
+    }
+
+    #[test]
+    fn shared_upstream_official_mode_without_managed_profile_is_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let original = format!(
+            "{{\n  \"upstreamOnly\": true,\n  \"activeRelayId\": \"{OFFICIAL_RELAY_ID}\",\n  \"relayProfiles\": [{{\"id\":\"upstream-profile\"}}]\n}}\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        assert!(!remove_owned_settings_state(&path, false).unwrap());
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn isolated_managed_settings_ignore_unrelated_damaged_legacy_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed, UapiConnectionMode::Uapi))
+            .unwrap();
+        let damaged = b"{damaged upstream settings without an owned provider";
+        std::fs::write(&legacy_path, damaged).unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+            .unwrap();
+
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .relay_profiles
+                .iter()
+                .any(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        );
+        assert_eq!(std::fs::read(legacy_path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn unavailable_official_snapshot_does_not_block_uapi_settings_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [serde_json::to_value(managed).unwrap()],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault.fail_get(CredentialSlot::OfficialAuthJson);
+
+        migrate_legacy_distribution_state_with(&store, &isolated_path, &legacy_path, &vault)
+            .unwrap();
+
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .relay_profiles
+                .iter()
+                .any(|profile| profile.id == distribution::FIXED_PROVIDER_ID)
+        );
+        let legacy_after: Value =
+            serde_json::from_str(&std::fs::read_to_string(legacy_path).unwrap()).unwrap();
+        assert!(legacy_after["relayProfiles"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2402,6 +4004,65 @@ mod tests {
     }
 
     #[test]
+    fn failed_connection_change_restores_settings_bytes_with_unknown_fields_and_legacy_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let settings_path = temp.path().join("settings.json");
+        let store = SettingsStore::new(settings_path.clone());
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let mut raw =
+            serde_json::to_value(managed_settings(profile, UapiConnectionMode::Uapi)).unwrap();
+        raw["futureTopLevelField"] = json!({"preserve": [1, 2, 3]});
+        raw["relayProfiles"][0]["apiKey"] = Value::String("test-legacy-raw-key-012345".into());
+        let mut original_bytes = serde_json::to_vec_pretty(&raw).unwrap();
+        original_bytes.push(b'\n');
+        std::fs::write(&settings_path, &original_bytes).unwrap();
+        let mut next_settings = store.load().unwrap();
+        next_settings.active_relay_id = OFFICIAL_RELAY_ID.to_string();
+        let vault = MemoryCredentialVault::default();
+
+        let error =
+            commit_connection_change(&store, &home, &vault, &next_settings, None, None, || {
+                anyhow::bail!("simulated raw settings rollback")
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated raw settings rollback")
+        );
+        assert_eq!(std::fs::read(settings_path).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn failed_connection_change_removes_settings_file_created_by_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let settings_path = temp.path().join("settings.json");
+        let store = SettingsStore::new(settings_path.clone());
+        let vault = MemoryCredentialVault::default();
+
+        let error = commit_connection_change(
+            &store,
+            &home,
+            &vault,
+            &BackendSettings::default(),
+            None,
+            None,
+            || anyhow::bail!("simulated first settings write failure"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated first settings write failure")
+        );
+        assert!(!settings_path.exists());
+    }
+
+    #[test]
     fn live_snapshot_restore_attempts_config_auth_and_catalog_after_failures() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
@@ -2466,6 +4127,625 @@ mod tests {
                 .contains("simulated catalog apply failure")
         );
         assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn uninstall_cleanup_restores_official_auth_and_removes_only_owned_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let unrelated = RelayProfile {
+            id: "user-provider".to_string(),
+            name: "User provider".to_string(),
+            ..RelayProfile::default()
+        };
+        let mut settings = managed_settings(managed.clone(), UapiConnectionMode::Uapi);
+        settings.relay_profiles.push(unrelated.clone());
+        store.save(&settings).unwrap();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "upstreamOnly": "preserve-me",
+                "relayProfiles": [
+                    serde_json::to_value(unrelated).unwrap(),
+                    serde_json::to_value(managed.clone()).unwrap()
+                ],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_live_uapi(&home, &managed, "sk-live-uapi-0123456789");
+        let mut live_config = std::fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        live_config["approval_policy"] = toml_edit::value("never");
+        live_config["model_providers"]["user_custom"]["base_url"] =
+            toml_edit::value("https://user.example/v1");
+        std::fs::write(home.join("config.toml"), live_config.to_string()).unwrap();
+        let vault = MemoryCredentialVault::default();
+        let official_auth = official_auth_json();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-live-uapi-0123456789")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth)
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("approval_policy = \"never\""));
+        assert!(config.contains("https://user.example/v1"));
+        assert!(!config.contains(distribution::FIXED_PROVIDER_ID));
+        assert!(!config.contains("model_catalog_json"));
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            official_auth
+        );
+        assert!(!managed_catalog_path(&home).exists());
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+        assert!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .is_none()
+        );
+        let isolated_after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&isolated_path).unwrap()).unwrap();
+        assert_eq!(
+            isolated_after["relayProfiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|profile| profile["id"] == distribution::FIXED_PROVIDER_ID)
+                .count(),
+            0
+        );
+        assert!(
+            isolated_after["relayProfiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile["id"] == "user-provider")
+        );
+        let legacy_after: Value =
+            serde_json::from_str(&std::fs::read_to_string(legacy_path).unwrap()).unwrap();
+        assert_eq!(legacy_after["upstreamOnly"], "preserve-me");
+        assert_eq!(legacy_after["relayProfiles"].as_array().unwrap().len(), 1);
+        assert_eq!(legacy_after["relayProfiles"][0]["id"], "user-provider");
+    }
+
+    #[test]
+    fn uninstall_cleanup_uses_the_captured_credentials_without_reading_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        write_live_uapi(&home, &managed, "sk-live-uapi-0123456789");
+        let vault = SingleReadCredentialVault::default();
+        let official_auth = official_auth_json();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-live-uapi-0123456789")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth)
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            official_auth
+        );
+        assert_eq!(vault.read_count(CredentialSlot::UapiApiKey), 1);
+        assert_eq!(vault.read_count(CredentialSlot::OfficialAuthJson), 1);
+        assert!(vault.peek(CredentialSlot::UapiApiKey).is_none());
+        assert!(vault.peek(CredentialSlot::OfficialAuthJson).is_none());
+    }
+
+    #[test]
+    fn uninstall_cleanup_preserves_foreign_live_key_without_proven_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        write_live_uapi(&home, &managed, "user-edited-foreign-key-012345");
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-owned-not-live-key-012345")
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!config.contains(distribution::FIXED_PROVIDER_ID));
+        assert!(!config.contains("model_catalog_json"));
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(isolated_path).unwrap()).unwrap();
+        assert!(
+            settings["relayProfiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|profile| profile["id"] != distribution::FIXED_PROVIDER_ID)
+        );
+        assert!(!managed_catalog_path(&home).exists());
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+        assert!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn uninstall_cleanup_recognizes_keys_from_every_duplicate_owned_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let mut profile_a = serde_json::to_value(&managed).unwrap();
+        profile_a["authContents"] = json!({"OPENAI_API_KEY": "sk-duplicate-a-012345"})
+            .to_string()
+            .into();
+        let mut profile_b = serde_json::to_value(&managed).unwrap();
+        let mut profile_b_config = profile_b["configContents"]
+            .as_str()
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        profile_b_config["experimental_bearer_token"] = toml_edit::value("sk-duplicate-b-012345");
+        profile_b["configContents"] = profile_b_config.to_string().into();
+        profile_b["modelList"] = json!({"futureShape": true});
+        std::fs::write(
+            &isolated_path,
+            serde_json::to_vec_pretty(&json!({
+                "relayProfiles": [profile_a, profile_b],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_live_uapi(&home, &managed, "sk-duplicate-b-012345");
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&json!({
+                "OPENAI_API_KEY": "sk-duplicate-b-012345",
+                "keep": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = MemoryCredentialVault::default();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).unwrap())
+                .unwrap();
+        assert!(auth.get("OPENAI_API_KEY").is_none());
+        assert_eq!(auth["keep"], true);
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(isolated_path).unwrap()).unwrap();
+        assert!(settings["relayProfiles"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uninstall_cleanup_does_not_replace_foreign_live_key_with_official_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        write_live_uapi(&home, &managed, "user-edited-foreign-key-012345");
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-owned-not-live-key-012345")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth_json())
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+        assert!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn uninstall_cleanup_preserves_newer_live_official_auth() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        write_live_uapi(&home, &managed, "sk-owned-live-uapi-012345");
+        let newer_live_auth = official_auth_json_with_access_token("newer-live-access-token");
+        crate::settings::atomic_write_private(&home.join("auth.json"), newer_live_auth.as_bytes())
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-owned-live-uapi-012345")
+            .unwrap();
+        vault
+            .set(
+                CredentialSlot::OfficialAuthJson,
+                &official_auth_json_with_access_token("stale-snapshot-access-token"),
+            )
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            newer_live_auth
+        );
+    }
+
+    #[test]
+    fn uninstall_cleanup_rolls_back_when_second_credential_delete_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+            .unwrap();
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&json!({
+                "upstreamOnly": "keep",
+                "relayProfiles": [serde_json::to_value(managed.clone()).unwrap()],
+                "activeRelayId": distribution::FIXED_PROVIDER_ID,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        write_live_uapi(&home, &managed, "test-uapi-live-key-012345");
+        let vault = MemoryCredentialVault::default();
+        let official_auth = official_auth_json();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-uapi-vault-key-012345")
+            .unwrap();
+        vault
+            .set(CredentialSlot::OfficialAuthJson, &official_auth)
+            .unwrap();
+        vault.fail_delete(CredentialSlot::OfficialAuthJson);
+        let isolated_before = std::fs::read(&isolated_path).unwrap();
+        let legacy_before = std::fs::read(&legacy_path).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+        let error =
+            uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("官方登录快照"));
+        assert_eq!(std::fs::read(&isolated_path).unwrap(), isolated_before);
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_before);
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-uapi-vault-key-012345")
+        );
+        assert_eq!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .as_deref(),
+            Some(official_auth.as_str())
+        );
+    }
+
+    #[test]
+    fn uninstall_cleanup_rolls_back_injected_settings_and_catalog_failures() {
+        for failure_point in [
+            UninstallFailurePoint::AfterIsolatedSettingsCleanup,
+            UninstallFailurePoint::AfterCatalogCleanup,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            let isolated_path = temp.path().join("isolated-settings.json");
+            let legacy_path = temp.path().join("legacy-settings.json");
+            let store = SettingsStore::new(isolated_path.clone());
+            let managed =
+                build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+            store
+                .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+                .unwrap();
+            write_live_uapi(&home, &managed, "test-uapi-live-key-012345");
+            let vault = MemoryCredentialVault::default();
+            let official_auth = official_auth_json();
+            vault
+                .set(CredentialSlot::UapiApiKey, "test-uapi-vault-key-012345")
+                .unwrap();
+            vault
+                .set(CredentialSlot::OfficialAuthJson, &official_auth)
+                .unwrap();
+            let isolated_before = std::fs::read(&isolated_path).unwrap();
+            let config_before = std::fs::read(home.join("config.toml")).unwrap();
+            let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+            let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+
+            let error = uninstall_cleanup_with_failure(
+                &isolated_path,
+                &legacy_path,
+                &home,
+                &vault,
+                Some(failure_point),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("simulated uninstall"));
+            assert_eq!(
+                std::fs::read(&isolated_path).unwrap(),
+                isolated_before,
+                "{failure_point:?}"
+            );
+            assert_eq!(
+                std::fs::read(home.join("config.toml")).unwrap(),
+                config_before,
+                "{failure_point:?}"
+            );
+            assert_eq!(
+                std::fs::read(home.join("auth.json")).unwrap(),
+                auth_before,
+                "{failure_point:?}"
+            );
+            assert_eq!(
+                std::fs::read(managed_catalog_path(&home)).unwrap(),
+                catalog_before,
+                "{failure_point:?}"
+            );
+            assert_eq!(
+                vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+                Some("test-uapi-vault-key-012345"),
+                "{failure_point:?}"
+            );
+            assert_eq!(
+                vault
+                    .get(CredentialSlot::OfficialAuthJson)
+                    .unwrap()
+                    .as_deref(),
+                Some(official_auth.as_str()),
+                "{failure_point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_cleanup_preserves_non_uapi_live_config_and_auth_byte_for_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let config = "model = \"user-model\"\nmodel_provider = \"user_custom\"\n\n[model_providers.user_custom]\nbase_url = \"https://user.example/v1\"\n";
+        let auth = r#"{"OPENAI_API_KEY":"user-owned-key","extra":"keep"}"#;
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        std::fs::write(home.join("auth.json"), auth).unwrap();
+        let catalog_path = managed_catalog_path(&home);
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        std::fs::write(&catalog_path, "{\"owned\":true}").unwrap();
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-vault-uapi-0123456789")
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            config
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            auth
+        );
+        assert!(!catalog_path.exists());
+    }
+
+    #[test]
+    fn uninstall_preserves_same_id_and_endpoint_with_foreign_transport_contract() {
+        for (name, from, to) in [
+            ("wire", "wire_api = \"responses\"", "wire_api = \"chat\""),
+            (
+                "auth",
+                "requires_openai_auth = false",
+                "requires_openai_auth = true",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            std::fs::create_dir_all(&home).unwrap();
+            let isolated_path = temp.path().join("isolated-settings.json");
+            let legacy_path = temp.path().join("legacy-settings.json");
+            let store = SettingsStore::new(isolated_path.clone());
+            let managed =
+                build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+            store
+                .save(&managed_settings(managed.clone(), UapiConnectionMode::Uapi))
+                .unwrap();
+            let config = managed.config_contents.replace(from, to);
+            let auth = r#"{"OPENAI_API_KEY":"test-shared-live-key-012345","keep":true}"#;
+            std::fs::write(home.join("config.toml"), &config).unwrap();
+            std::fs::write(home.join("auth.json"), auth).unwrap();
+            let vault = MemoryCredentialVault::default();
+            vault
+                .set(CredentialSlot::UapiApiKey, "test-shared-live-key-012345")
+                .unwrap();
+
+            assert!(!read_live_managed_state(&home).provider_matches, "{name}");
+            uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(home.join("config.toml")).unwrap(),
+                config,
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.join("auth.json")).unwrap(),
+                auth,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_cleanup_refuses_damaged_settings_before_mutating_live_or_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        write_live_uapi(&home, &managed, "sk-live-uapi-0123456789");
+        let live_config = std::fs::read(home.join("config.toml")).unwrap();
+        let live_auth = std::fs::read(home.join("auth.json")).unwrap();
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        std::fs::write(&isolated_path, "{damaged json").unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-vault-uapi-0123456789")
+            .unwrap();
+
+        let error =
+            uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("有效 JSON"));
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            live_config
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), live_auth);
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("sk-vault-uapi-0123456789")
+        );
+        assert_eq!(
+            std::fs::read_to_string(isolated_path).unwrap(),
+            "{damaged json"
+        );
+    }
+
+    #[test]
+    fn uninstall_cleanup_ignores_unrelated_damaged_legacy_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let config = "model = \"user-model\"\n";
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(managed, UapiConnectionMode::Uapi))
+            .unwrap();
+        let damaged = b"{damaged upstream settings without an owned provider";
+        std::fs::write(&legacy_path, damaged).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-vault-uapi-0123456789")
+            .unwrap();
+
+        uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            config
+        );
+        assert_eq!(std::fs::read(legacy_path).unwrap(), damaged);
+        assert!(vault.get(CredentialSlot::UapiApiKey).unwrap().is_none());
+    }
+
+    #[test]
+    fn uninstall_cleanup_is_fail_closed_when_official_snapshot_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let managed = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        write_live_uapi(&home, &managed, "sk-live-uapi-0123456789");
+        let isolated_path = temp.path().join("isolated-settings.json");
+        let legacy_path = temp.path().join("legacy-settings.json");
+        let store = SettingsStore::new(isolated_path.clone());
+        store
+            .save(&managed_settings(managed, UapiConnectionMode::Uapi))
+            .unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "sk-live-uapi-0123456789")
+            .unwrap();
+        let isolated_before = std::fs::read(&isolated_path).unwrap();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let auth_before = std::fs::read(home.join("auth.json")).unwrap();
+        let catalog_before = std::fs::read(managed_catalog_path(&home)).unwrap();
+        vault.fail_get(CredentialSlot::OfficialAuthJson);
+
+        let error =
+            uninstall_cleanup_with(&isolated_path, &legacy_path, &home, &vault).unwrap_err();
+
+        assert!(error.to_string().contains("凭证快照"));
+        assert_eq!(std::fs::read(&isolated_path).unwrap(), isolated_before);
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config_before
+        );
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth_before);
+        assert_eq!(
+            std::fs::read(managed_catalog_path(&home)).unwrap(),
+            catalog_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("sk-live-uapi-0123456789")
+        );
     }
 
     #[test]

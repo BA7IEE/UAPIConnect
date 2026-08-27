@@ -5,6 +5,14 @@
   overflow-y: auto;
 }
 
+/* The shared manager shell injects a CodexPlusPlus C++ mark with ::before.
+   This distribution renders its own U mark, so keep the upstream decoration
+   out of the isolated U-API shell. */
+.uapi-shell .brand::before {
+  content: none;
+  display: none;
+}
+
 .uapi-stack {
   display: grid;
   gap: 14px;
@@ -124,6 +132,16 @@
   gap: 8px;
 }
 
+.uapi-shell .status-row {
+  grid-template-columns: minmax(110px, 140px) minmax(0, 1fr);
+}
+
+.uapi-shell .status-row > strong,
+.uapi-shell .status-row > code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .uapi-model-list {
   display: flex;
   flex-wrap: wrap;
@@ -222,5 +240,20 @@
 
   .uapi-health-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 860px) {
+  .uapi-shell .health-item .uapi-badge {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
+
+@media (max-width: 760px) {
+  .uapi-shell .status-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+    align-items: start;
   }
 }

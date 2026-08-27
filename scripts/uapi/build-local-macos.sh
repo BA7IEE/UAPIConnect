@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export UAPI_CONNECT_DISTRIBUTION=1
 LOG_ROOT="$ROOT/local-build-logs"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="$LOG_ROOT/$STAMP"
@@ -98,10 +99,10 @@ npm run vite:build
 step "7/9 Rust 格式与测试"
 cd "$ROOT"
 cargo fmt --all -- --check
-cargo test --workspace
+cargo test --workspace --locked
 
 step "8/9 构建 Release 二进制"
-cargo build --release
+cargo build --release --locked
 
 test -x "$ROOT/target/release/codex-plus-plus" || fail "缺少启动器二进制。"
 test -x "$ROOT/target/release/codex-plus-plus-manager" || fail "缺少设置程序二进制。"

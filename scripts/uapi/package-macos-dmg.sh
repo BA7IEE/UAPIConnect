@@ -3,6 +3,11 @@ set -euo pipefail
 
 VERSION="${1:-0.0.0}"
 ARCH="${2:-$(uname -m)}"
+BUNDLE_VERSION="${VERSION%%-*}"
+if [[ ! "$BUNDLE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "invalid macOS bundle version derived from release version: $VERSION" >&2
+  exit 1
+fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIST="$ROOT/dist/uapi/macos"
 STAGE="$DIST/stage"
@@ -67,8 +72,8 @@ create_app() {
   <key>CFBundleName</key><string>$app_name</string>
   <key>CFBundleDisplayName</key><string>$app_name</string>
   <key>CFBundleIdentifier</key><string>$bundle_id</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUNDLE_VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$BUNDLE_VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>$executable_name</string>
   <key>CFBundleIconFile</key><string>$ICON_NAME</string>
@@ -105,4 +110,5 @@ for attempt in 1 2 3; do
 done
 
 [ "$created" = true ] || { echo "failed to create DMG" >&2; exit 1; }
+hdiutil verify "$DMG" >/dev/null
 echo "$DMG"

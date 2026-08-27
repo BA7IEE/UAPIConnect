@@ -41,6 +41,40 @@ fn manager_repeated_launch_activates_existing_window() {
 }
 
 #[test]
+fn manager_configure_request_is_persisted_before_single_instance_guard() {
+    let main_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+        .expect("read manager main.rs");
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read manager lib.rs");
+    let activation = main_rs
+        .find("manager_activation::request_configure()")
+        .expect("configure activation marker");
+    let manager_run = main_rs
+        .find("codex_plus_manager_lib::run();")
+        .expect("manager run");
+
+    assert!(activation < manager_run);
+    assert!(lib_rs.contains("uapi_take_manager_activation"));
+}
+
+#[test]
+fn ordinary_manager_reopen_only_focuses_the_existing_window() {
+    let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read manager lib.rs");
+    let reopen = lib_rs
+        .find("tauri::RunEvent::Reopen")
+        .expect("macOS reopen handler");
+    let end = lib_rs[reopen..]
+        .find("_ => {}")
+        .map(|offset| reopen + offset)
+        .expect("end of macOS event handler");
+    let reopen_handler = &lib_rs[reopen..end];
+
+    assert!(reopen_handler.contains("show_main_window(app_handle)"));
+    assert!(!reopen_handler.contains("request_configure"));
+}
+
+#[test]
 fn manager_main_window_uses_default_window_icon_explicitly() {
     let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read manager lib.rs");
@@ -254,10 +288,14 @@ fn github_release_workflow_builds_separate_macos_x64_and_arm64_dmgs() {
 
     assert!(workflow.contains("macos-15-intel"));
     assert!(workflow.contains("x86_64-apple-darwin"));
-    assert!(workflow.contains("macos-14"));
+    assert!(workflow.contains("runner: macos-15"));
     assert!(workflow.contains("aarch64-apple-darwin"));
-    assert!(workflow.contains("package-dmg.sh \"$VERSION\" \"${{ matrix.arch }}\""));
+    assert!(
+        workflow.contains("scripts/uapi/package-macos-dmg.sh \"$version\" \"${{ matrix.arch }}\"")
+    );
     assert!(workflow.contains("target/${{ matrix.target }}/release"));
+    assert!(workflow.contains("UAPI_CONNECT_DISTRIBUTION: \"1\""));
+    assert!(!workflow.contains("scripts/installer/macos/package-dmg.sh"));
 }
 
 #[test]
@@ -273,7 +311,15 @@ fn github_release_workflow_uploads_static_latest_json() {
 
     assert!(workflow.contains("latest-json:"));
     assert!(workflow.contains("latest.json"));
-    assert!(workflow.contains("gh release upload \"$TAG\" latest.json --clobber"));
+    assert!(workflow.contains("SHA256SUMS"));
+    assert!(workflow.contains("sha256sum --check SHA256SUMS"));
+    assert!(
+        workflow.contains(
+            "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2"
+        )
+    );
+    assert!(workflow.contains("overwrite_files: false"));
+    assert!(workflow.contains("files: dist/release/*"));
 }
 
 #[test]

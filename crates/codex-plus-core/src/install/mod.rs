@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub mod macos;
@@ -278,13 +279,21 @@ where
         .map(|arg| arg.as_ref().to_os_string())
         .collect::<Vec<OsString>>();
 
+    if companion_requests_manager_configuration(binary, &args) {
+        crate::manager_activation::request_configure()
+            .context("无法通知已运行的 U-API Connect 设置窗口")?;
+    }
+
     #[cfg(target_os = "macos")]
     {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
         if let Some(bundle_id) = macos_companion_bundle_identifier_from_exe(&exe, binary) {
+            let open_args = macos_open_bundle_arguments(bundle_id, &args);
             let launch_result = Command::new("/usr/bin/open")
-                .args(["-n", "-b", bundle_id, "--args"])
-                .args(&args)
+                // Reuse and reactivate an existing bundle. `-n` forced a second
+                // manager process which immediately lost the single-instance
+                // guard, leaving the original hidden window untouched.
+                .args(open_args)
                 .status();
             if launch_result.as_ref().is_ok_and(|status| status.success()) {
                 return Ok(format!("bundle:{bundle_id}"));
@@ -311,6 +320,23 @@ where
         .spawn()
         .map_err(|error| anyhow::anyhow!("无法启动 {}：{error}", path.to_string_lossy()))?;
     Ok(path.to_string_lossy().to_string())
+}
+
+fn companion_requests_manager_configuration(binary: &str, args: &[OsString]) -> bool {
+    crate::distribution::FIXED_PROVIDER_EDITION
+        && binary == MANAGER_BINARY
+        && args.iter().any(|arg| arg == "--configure")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_open_bundle_arguments(bundle_id: &str, args: &[OsString]) -> Vec<OsString> {
+    let mut open_args = vec![
+        OsString::from("-b"),
+        OsString::from(bundle_id),
+        OsString::from("--args"),
+    ];
+    open_args.extend(args.iter().cloned());
+    open_args
 }
 
 pub fn macos_companion_bundle_identifier_from_exe(
@@ -358,6 +384,69 @@ fn is_macos_development_bundle(exe: &Path) -> bool {
         && exe
             .components()
             .any(|component| component.as_os_str() == "bundle")
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_companion_open_reuses_the_existing_bundle() {
+        let args = macos_open_bundle_arguments(MANAGER_BUNDLE_ID, &[OsString::from("--configure")]);
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-b"),
+                OsString::from(MANAGER_BUNDLE_ID),
+                OsString::from("--args"),
+                OsString::from("--configure"),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "-n"));
+    }
+}
+
+#[cfg(test)]
+mod manager_activation_tests {
+    use super::*;
+
+    #[test]
+    fn only_manager_configure_launches_request_an_activation() {
+        assert!(companion_requests_manager_configuration(
+            MANAGER_BINARY,
+            &[OsString::from("--configure")]
+        ));
+        assert!(!companion_requests_manager_configuration(
+            MANAGER_BINARY,
+            &[]
+        ));
+        assert!(!companion_requests_manager_configuration(
+            SILENT_BINARY,
+            &[OsString::from("--configure")]
+        ));
+        assert!(!companion_requests_manager_configuration(
+            MANAGER_BINARY,
+            &[OsString::from("--show-update")]
+        ));
+    }
+
+    #[test]
+    fn activation_is_requested_before_any_platform_launch() {
+        let source = include_str!("mod.rs");
+        let activation = source
+            .find("companion_requests_manager_configuration(binary, &args)")
+            .expect("configure activation hook");
+        let macos_launch = source
+            .find("Command::new(\"/usr/bin/open\")")
+            .expect("macOS bundle launch");
+        let process_launch = source
+            .find("let mut command = Command::new(&path)")
+            .expect("direct companion launch");
+
+        assert!(activation < macos_launch);
+        assert!(activation < process_launch);
+    }
 }
 
 #[cfg(target_os = "macos")]
