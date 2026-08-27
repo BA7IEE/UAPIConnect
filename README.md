@@ -115,12 +115,14 @@ cargo test --workspace --locked
 
 Windows 安装、升级和注册表卸载链由 `scripts/uapi/tests/windows-installer-lifecycle.ps1` 在 Windows CI 中实测。macOS Release 分别在 Intel 与 Apple Silicon runner 上生成 U-API 专用 DMG。只有所有平台验证完成后，工作流才会把安装包、`SHA256SUMS` 和 `latest.json` 发布到 Release。
 
-正式发布时只需在已经合并到 `main` 的提交上推送 `v<基础版本>-uapi.<序号>` 格式的 tag，例如 `v1.2.55-uapi.1`。不要提前手工创建 Release；tag 工作流会先完成三平台验证，全部通过后再创建 Release，避免公开空包或未验证资产。
+正式发布时只需在已经合并到 `main` 的提交上推送 `v<基础版本>-uapi.<序号>` 格式的 tag，例如 `v1.2.56-uapi.1`。不要提前手工创建 Release；tag 工作流会先完成三平台验证，全部通过后再创建 Release，避免公开空包或未验证资产。
 
 发布者若要启用 Windows Authenticode，需要同时配置仓库 Secrets `WINDOWS_CERTIFICATE` 和 `WINDOWS_CERTIFICATE_PASSWORD`。前者是带私钥、具备 Code Signing EKU 的 PFX 文件经 Base64 编码后的内容，后者是 PFX 密码。两项都不配置时会正常生成未签名 Release；只配置其中一项时工作流会中止，证书文件和密码都不得提交到仓库。
 
 ## 上游与许可
 
-本项目基于 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 修改，当前代码基线版本为 1.2.55。通用启动、配置管理和桌面应用能力来自上游；U-API Connect 增加了固定服务发行策略、独立界面、凭证隔离与专用安装交付链。上游项目与贡献者保留其原有署名。
+本项目基于 [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 修改，当前代码基线版本为 1.2.56。通用启动、配置管理和桌面应用能力来自上游；U-API Connect 增加了固定服务发行策略、独立界面、凭证隔离与专用安装交付链。上游项目与贡献者保留其原有署名。
+
+本次同步保留了上游 1.2.56 的无认证上游模式、自定义 cc-switch 数据库路径、浮动面板重构和 Windows 路径兼容修复。它们属于通用管理层；U-API 专用发行界面仍固定使用 U-API 服务地址，不开放任意供应商配置。
 
 项目采用 [GNU Affero General Public License v3.0](LICENSE)，SPDX 标识为 `AGPL-3.0-only`。本项目不是 OpenAI 官方产品，也未获得 OpenAI、ChatGPT 或 Codex 商标授权。

@@ -630,6 +630,7 @@ fn build_managed_profile(selected_model: &str, models: &[String]) -> anyhow::Res
         api_key: String::new(),
         protocol: RelayProtocol::Responses,
         relay_mode: RelayMode::PureApi,
+        no_auth: false,
         official_mix_api_key: false,
         hide_official_usage_alert: true,
         test_model: selected_model.to_string(),

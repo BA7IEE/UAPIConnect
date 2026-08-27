@@ -128,7 +128,7 @@ https://token.u-studio.cn/v1
 当前主线建立在上游稳定发行版上：
 
 ```text
-v1.2.55  CodexPlusPlus 上游发行基线
+v1.2.56  CodexPlusPlus 上游发行基线
 后续提交  U-API Connect 定制与同步修复
 ```
 

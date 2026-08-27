@@ -341,6 +341,10 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
         .and_then(|values| values.get("requires_openai_auth"))
         .map(|value| value.trim() == "true")
         .unwrap_or(false);
+    let explicitly_disables_auth = provider
+        .as_ref()
+        .and_then(|values| values.get("requires_openai_auth"))
+        .is_some_and(|value| value.trim() == "false");
     let has_bearer_token = provider
         .as_ref()
         .and_then(|values| values.get("experimental_bearer_token"))
@@ -354,7 +358,7 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
         .unwrap_or(false);
     RelayConfigStatus {
         configured: root_provider.is_some()
-            && (has_bearer_token || has_auth_api_key)
+            && (has_bearer_token || has_auth_api_key || explicitly_disables_auth)
             && has_base_url,
         requires_openai_auth,
         has_bearer_token,
@@ -372,7 +376,10 @@ fn provider_values_are_configured(
     let has_bearer_token = values
         .get("experimental_bearer_token")
         .is_some_and(|value| !unquote_toml_string(value).trim().is_empty());
-    has_base_url && (has_bearer_token || has_auth_api_key)
+    let explicitly_disables_auth = values
+        .get("requires_openai_auth")
+        .is_some_and(|value| value.trim() == "false");
+    has_base_url && (has_bearer_token || has_auth_api_key || explicitly_disables_auth)
 }
 
 pub fn responses_proxy_configured_in_home(home: &Path) -> bool {
@@ -573,7 +580,8 @@ fn apply_relay_profile_files_to_home_with_context_locked(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-        apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+        let auth_contents = relay_profile_auth_contents_for_apply(profile)?;
+        apply_relay_files_to_home(home, &compatible_config, &auth_contents)
     })
 }
 
@@ -613,12 +621,21 @@ fn apply_relay_profile_to_home_with_switch_rules_locked(
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
         if profile.relay_mode == crate::settings::RelayMode::PureApi {
-            apply_relay_files_to_home(home, &compatible_config, &profile.auth_contents)
+            let auth_contents = relay_profile_auth_contents_for_apply(profile)?;
+            apply_relay_files_to_home(home, &compatible_config, &auth_contents)
         } else {
             let auth_contents = official_profile_auth_for_switch(home, &profile.auth_contents)?;
             apply_relay_files_to_home(home, &compatible_config, &auth_contents)
         }
     })
+}
+
+fn relay_profile_auth_contents_for_apply(profile: &RelayProfile) -> anyhow::Result<String> {
+    if profile.uses_no_auth() {
+        no_auth_auth_contents(&profile.auth_contents)
+    } else {
+        Ok(profile.auth_contents.clone())
+    }
 }
 
 pub fn apply_relay_profile_config_to_home_with_context(
@@ -806,7 +823,7 @@ pub async fn test_relay_profile(
     }
     let api_key = relay_profile_api_key(profile);
     let api_key = api_key.trim();
-    if api_key.is_empty() {
+    if api_key.is_empty() && !profile.uses_no_auth() {
         anyhow::bail!("API Key 不能为空");
     }
 
@@ -821,13 +838,14 @@ pub async fn test_relay_profile(
     }
 
     let payload = relay_profile_test_payload(profile.protocol, test_model);
-    let response = client
+    let mut request = client
         .post(&endpoint)
-        .bearer_auth(api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&payload)
-        .send()
-        .await?;
+        .json(&payload);
+    if !profile.uses_no_auth() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await?;
     let http_status = response.status().as_u16();
 
     // 如果 404 且 base_url 末尾没有 /v1，尝试自动补 /v1 后再发一次。
@@ -839,13 +857,14 @@ pub async fn test_relay_profile(
             RelayProtocol::Responses => format!("{v1_url}/responses"),
             RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
         };
-        let v1_response = client
+        let mut request = client
             .post(&v1_endpoint)
-            .bearer_auth(api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+            .json(&payload);
+        if !profile.uses_no_auth() {
+            request = request.bearer_auth(api_key);
+        }
+        let v1_response = request.send().await?;
         let v1_status = v1_response.status().as_u16();
         if v1_status < 400 {
             let response_text = v1_response.text().await.unwrap_or_default();
@@ -2664,6 +2683,13 @@ fn restore_profile_credentials_after_backfill(
     template_api_key: &str,
     live_auth: &str,
 ) -> anyhow::Result<()> {
+    if profile.uses_no_auth() {
+        profile.config_contents =
+            remove_experimental_bearer_token_from_config(&profile.config_contents)?;
+        profile.auth_contents = no_auth_auth_contents(template_auth)?;
+        profile.api_key.clear();
+        return Ok(());
+    }
     if profile.relay_mode == crate::settings::RelayMode::PureApi {
         profile.config_contents =
             remove_experimental_bearer_token_from_config(&profile.config_contents)?;
@@ -2752,6 +2778,11 @@ fn set_experimental_bearer_token_in_config(
 }
 
 fn sync_profile_mode_from_backfilled_live(profile: &mut RelayProfile) {
+    if profile.uses_no_auth() {
+        profile.relay_mode = crate::settings::RelayMode::PureApi;
+        profile.official_mix_api_key = false;
+        return;
+    }
     if profile.relay_mode == crate::settings::RelayMode::Official && !profile.official_mix_api_key {
         return;
     }
@@ -2850,6 +2881,9 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
 }
 
 pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
+    if profile.uses_no_auth() {
+        return String::new();
+    }
     if profile.relay_mode == crate::settings::RelayMode::Aggregate {
         return "codex-plus-aggregate".to_string();
     }
@@ -2946,7 +2980,9 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["wire_api"] = toml_edit::value("responses");
     }
-    if profile.relay_mode != crate::settings::RelayMode::PureApi
+    if profile.uses_no_auth() {
+        provider["requires_openai_auth"] = toml_edit::value(true);
+    } else if profile.relay_mode != crate::settings::RelayMode::PureApi
         && provider
             .get("requires_openai_auth")
             .and_then(Item::as_bool)
@@ -2954,7 +2990,7 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["requires_openai_auth"] = toml_edit::value(true);
     }
-    let provider_base_url = if profile.has_model_routes() {
+    let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
         crate::protocol_proxy::local_responses_proxy_base_url(
             crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
         )
@@ -2968,7 +3004,10 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     if !provider_base_url.trim().is_empty() {
         provider["base_url"] = toml_edit::value(provider_base_url.trim());
     }
-    if profile.relay_mode == crate::settings::RelayMode::PureApi {
+    if profile.uses_no_auth() {
+        provider["experimental_bearer_token"] =
+            toml_edit::value(crate::protocol_proxy::NO_AUTH_PROXY_BEARER_TOKEN);
+    } else if profile.relay_mode == crate::settings::RelayMode::PureApi {
         provider.remove("experimental_bearer_token");
     } else if !api_key.trim().is_empty() {
         provider["experimental_bearer_token"] = toml_edit::value(api_key.trim());
@@ -2980,6 +3019,12 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
 }
 
 pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow::Result<()> {
+    profile.no_auth = profile.relay_mode == crate::settings::RelayMode::PureApi && profile.no_auth;
+    if profile.no_auth {
+        profile.api_key.clear();
+        profile.sub2api_enabled = false;
+        profile.sub2api_multiplier.clear();
+    }
     let mut seen_models = HashSet::new();
     profile.model_routes = profile
         .model_routes
@@ -3049,6 +3094,9 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
                 // auth.json 本身已损坏时保不住原内容，但 key 必须有落点，直接重建。
                 .or_else(|_| set_openai_api_key_in_auth_contents("", &source_api_key))?;
     }
+    if profile.uses_no_auth() {
+        profile.auth_contents = no_auth_auth_contents(&profile.auth_contents)?;
+    }
     if profile.relay_mode == crate::settings::RelayMode::Official {
         profile.auth_contents = remove_openai_api_key_from_auth_contents(&profile.auth_contents)?;
     }
@@ -3073,6 +3121,19 @@ fn remove_openai_api_key_from_auth_contents(auth_contents: &str) -> anyhow::Resu
     if object.is_empty() {
         return Ok(String::new());
     }
+    Ok(format!("{}\n", serde_json::to_string_pretty(&value)?))
+}
+
+fn no_auth_auth_contents(auth_contents: &str) -> anyhow::Result<String> {
+    let mut value = if auth_contents.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(auth_contents).with_context(|| "auth.json JSON 解析失败")?
+    };
+    let Some(object) = value.as_object_mut() else {
+        anyhow::bail!("auth.json 必须是 JSON 对象");
+    };
+    object.remove("OPENAI_API_KEY");
     Ok(format!("{}\n", serde_json::to_string_pretty(&value)?))
 }
 
