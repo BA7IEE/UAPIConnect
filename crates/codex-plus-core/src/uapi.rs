@@ -977,6 +977,8 @@ fn build_managed_profile(selected_model: &str, models: &[String]) -> anyhow::Res
         model_insert_mode: RelayModelInsertMode::ModelCatalog,
         model_list,
         model_windows: serde_json::to_string(&model_windows)?,
+        model_auto_compact: String::new(),
+        model_metadata: String::new(),
         model_vlm: String::new(),
         vlm_api_key: String::new(),
         vlm_model: String::new(),
@@ -2948,6 +2950,7 @@ pub fn apply_distribution_feature_defaults(settings: &mut BackendSettings) {
     settings.codex_app_pet_real_mouse_look = false;
     settings.codex_app_stepwise_enabled = false;
     settings.codex_app_stepwise_direct_send = false;
+    settings.codex_app_answer_outline_enabled = false;
     settings.codex_app_image_overlay_enabled = false;
     settings.codex_app_dream_skin_enabled = false;
     settings.codex_app_dream_skin_paused = true;
@@ -3533,6 +3536,13 @@ mod tests {
         );
         profile.auth_contents = r#"{"OPENAI_API_KEY":"test-legacy-profile-key"}"#.to_string();
         profile.upstream_base_url = "https://foreign.example/v1".to_string();
+        profile.model_metadata =
+            r#"{"gpt-5-codex":{"context_window":1,"slug":"foreign"}}"#.to_string();
+        profile.model_auto_compact = r#"{"gpt-5-codex":"1%"}"#.to_string();
+        profile.model_vlm = r#"{"gpt-5-codex":"vlm"}"#.to_string();
+        profile.vlm_api_key = "test-untrusted-vlm-key".to_string();
+        profile.vlm_base_url = "https://foreign.example/v1".to_string();
+        profile.vlm_model = "foreign-vision".to_string();
 
         let canonical = canonicalize_managed_profile(&profile).unwrap();
 
@@ -3546,6 +3556,40 @@ mod tests {
         );
         assert!(canonical.auth_contents.is_empty());
         assert!(!canonical.upstream_base_url.contains("foreign.example"));
+        assert!(canonical.model_metadata.is_empty());
+        assert!(canonical.model_auto_compact.is_empty());
+        assert!(canonical.model_vlm.is_empty());
+        assert!(canonical.vlm_api_key.is_empty());
+        assert!(canonical.vlm_base_url.is_empty());
+        assert!(canonical.vlm_model.is_empty());
+    }
+
+    #[test]
+    fn old_managed_profile_keeps_windows_without_enabling_new_overrides() {
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        let mut old = serde_json::to_value(&profile).unwrap();
+        old.as_object_mut().unwrap().remove("modelAutoCompact");
+        old.as_object_mut().unwrap().remove("modelMetadata");
+        let loaded: RelayProfile = serde_json::from_value(old).unwrap();
+        assert_eq!(loaded.model_windows, profile.model_windows);
+        assert!(loaded.model_auto_compact.is_empty());
+        assert!(loaded.model_metadata.is_empty());
+
+        let temp = tempfile::tempdir().unwrap();
+        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
+            temp.path(),
+            &loaded,
+            "",
+        )
+        .unwrap();
+        let catalog: Value =
+            serde_json::from_slice(&std::fs::read(managed_catalog_path(temp.path())).unwrap())
+                .unwrap();
+        assert_eq!(
+            catalog["models"][0]["context_window"].as_u64(),
+            Some(LARGE_CONTEXT_WINDOW.parse::<u64>().unwrap())
+        );
+        assert!(catalog["models"][0]["auto_compact_token_limit"].is_null());
     }
 
     #[test]
@@ -6026,6 +6070,70 @@ mod tests {
     }
 
     #[test]
+    fn external_catalog_conflict_preserves_uapi_files_settings_and_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let config = "# user-owned\nmodel = \"before\"\nmodel_catalog_json = \"external.json\"\n";
+        let auth = official_auth_json();
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        std::fs::write(home.join("auth.json"), &auth).unwrap();
+        let external_catalog = br#"{"models":[{"slug":"before","custom":true}]}"#;
+        std::fs::write(home.join("external.json"), external_catalog).unwrap();
+        let catalog_path = managed_catalog_path(&home);
+        std::fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let old_catalog = br#"{"models":[{"slug":"cached"}]}"#;
+        std::fs::write(&catalog_path, old_catalog).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let profile = build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        store
+            .save(&managed_settings(profile, UapiConnectionMode::Official))
+            .unwrap();
+        let settings_before = std::fs::read(temp.path().join("settings.json")).unwrap();
+        let vault = MemoryCredentialVault::default();
+        vault
+            .set(CredentialSlot::UapiApiKey, "test-uapi-old-key")
+            .unwrap();
+        vault.set(CredentialSlot::OfficialAuthJson, &auth).unwrap();
+
+        let error = switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Uapi)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("外部 model_catalog_json"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(home.join("config.toml")).unwrap(),
+            config.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            auth.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(home.join("external.json")).unwrap(),
+            external_catalog
+        );
+        assert_eq!(std::fs::read(catalog_path).unwrap(), old_catalog);
+        assert_eq!(
+            std::fs::read(temp.path().join("settings.json")).unwrap(),
+            settings_before
+        );
+        assert_eq!(
+            vault.get(CredentialSlot::UapiApiKey).unwrap().as_deref(),
+            Some("test-uapi-old-key")
+        );
+        assert_eq!(
+            vault
+                .get(CredentialSlot::OfficialAuthJson)
+                .unwrap()
+                .as_deref(),
+            Some(auth.as_str())
+        );
+    }
+
+    #[test]
     fn failed_connection_change_restores_settings_bytes_with_unknown_fields_and_legacy_key() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -6902,6 +7010,7 @@ mod tests {
     #[test]
     fn distribution_defaults_disable_hidden_runtime_features() {
         let mut settings = BackendSettings::default();
+        settings.codex_app_answer_outline_enabled = true;
         apply_distribution_feature_defaults(&mut settings);
         assert!(!settings.enhancements_enabled);
         assert!(!settings.provider_sync_enabled);
@@ -6912,6 +7021,7 @@ mod tests {
         assert!(!settings.codex_app_zed_remote_open);
         assert!(!settings.codex_app_upstream_worktree_create);
         assert!(!settings.codex_app_stepwise_enabled);
+        assert!(!settings.codex_app_answer_outline_enabled);
         assert!(!settings.codex_app_dream_skin_enabled);
         assert!(!settings.weixin_connect_enabled);
     }

@@ -22,16 +22,19 @@ const _profileTypeCheck: RelayProfile = {
   protocol: "responses",
   relayMode: "official",
   officialMixApiKey: false,
-  noAuth: false,
   hideOfficialUsageAlert: false,
   testModel: "",
   configContents: "",
   authContents: "",
   useCommonConfig: true,
+  contextSelection: { mcpServers: [], skills: [], plugins: [] },
+  contextSelectionInitialized: false,
   contextWindow: "",
   autoCompactLimit: "",
   modelList: "",
   modelWindows: "",
+  modelAutoCompact: "",
+  modelMetadata: "",
   modelVlm: "",
   vlmApiKey: "",
   vlmModel: "",
@@ -92,9 +95,9 @@ describe("model-windows helpers", () => {
     assert.deepStrictEqual(
       result.rows,
       [
-        { model: "a", window: "1M", imageHandling: "send-as-is" },
-        { model: "b", window: "", imageHandling: "send-as-is" },
-        { model: "c", window: "200K", imageHandling: "send-as-is" },
+        { model: "a", window: "1M", autoCompact: "", imageHandling: "send-as-is" },
+        { model: "b", window: "", autoCompact: "", imageHandling: "send-as-is" },
+        { model: "c", window: "200K", autoCompact: "", imageHandling: "send-as-is" },
       ],
     );
   });
@@ -105,9 +108,38 @@ describe("model-windows helpers", () => {
     assert.deepStrictEqual(
       result.rows,
       [
-        { model: "a", window: "", imageHandling: "vlm" },
-        { model: "b", window: "", imageHandling: "strip" },
-        { model: "c", window: "", imageHandling: "send-as-is" },
+        { model: "a", window: "", autoCompact: "", imageHandling: "vlm" },
+        { model: "b", window: "", autoCompact: "", imageHandling: "strip" },
+        { model: "c", window: "", autoCompact: "", imageHandling: "send-as-is" },
+      ],
+    );
+  });
+
+  it("modelWindowRowsFromProfile 拒绝损坏 map 中的非字符串值而不崩溃", () => {
+    const result = modelWindowRowsFromProfile(
+      "a\nb",
+      '{"a":1048576,"b":"512K"}',
+      '{"a":true,"b":"strip"}',
+      '{"a":90,"b":"80%"}',
+    );
+    assert.ok(result.validationError);
+    assert.deepStrictEqual(
+      result.rows,
+      [
+        { model: "a", window: "", autoCompact: "", imageHandling: "send-as-is" },
+        { model: "b", window: "", autoCompact: "", imageHandling: "strip" },
+      ],
+    );
+  });
+
+  it("modelWindowRowsFromProfile 不因 null map 崩溃", () => {
+    const result = modelWindowRowsFromProfile("a\nb", "null", "{}", "null");
+    assert.ok(result.validationError);
+    assert.deepStrictEqual(
+      result.rows,
+      [
+        { model: "a", window: "", autoCompact: "", imageHandling: "send-as-is" },
+        { model: "b", window: "", autoCompact: "", imageHandling: "send-as-is" },
       ],
     );
   });
@@ -116,8 +148,8 @@ describe("model-windows helpers", () => {
     const result = modelWindowRowsFromProfile("a\nb", "not-json");
     assert.ok(result.validationError?.includes("不是有效 JSON 对象"));
     assert.deepStrictEqual(result.rows, [
-      { model: "a", window: "", imageHandling: "send-as-is" },
-      { model: "b", window: "", imageHandling: "send-as-is" },
+      { model: "a", window: "", autoCompact: "", imageHandling: "send-as-is" },
+      { model: "b", window: "", autoCompact: "", imageHandling: "send-as-is" },
     ]);
   });
 
@@ -126,7 +158,7 @@ describe("model-windows helpers", () => {
       const result = modelWindowRowsFromProfile("a", serialized);
       assert.strictEqual(result.validationError, null);
       assert.deepStrictEqual(result.rows, [
-        { model: "a", window: "", imageHandling: "send-as-is" },
+        { model: "a", window: "", autoCompact: "", imageHandling: "send-as-is" },
       ]);
     }
   });
@@ -140,34 +172,49 @@ describe("model-windows helpers", () => {
   it("serializeModelWindowRows 从行控件生成 modelList、modelWindows 和 modelVlm", () => {
     assert.deepStrictEqual(
       serializeModelWindowRows([
-        { model: "a", window: "1M", imageHandling: "vlm" },
-        { model: "", window: "400K", imageHandling: "send-as-is" },
-        { model: "b", window: "", imageHandling: "send-as-is" },
+        { model: "a", window: "1M", autoCompact: "", imageHandling: "vlm" },
+        { model: "", window: "400K", autoCompact: "", imageHandling: "send-as-is" },
+        { model: "b", window: "", autoCompact: "", imageHandling: "send-as-is" },
       ]),
       {
         modelList: "a\nb",
         modelWindows: '{"a":"1M"}',
         modelVlm: '{"a":"vlm"}',
+        modelAutoCompact: '{}',
       },
     );
+  });
+
+  it("删除模型后序列化保存载荷不会保留已删除模型", () => {
+    const rows = [
+      { model: "keep", window: "1M", autoCompact: "90%", imageHandling: "send-as-is" as const },
+      { model: "remove", window: "200K", autoCompact: "80%", imageHandling: "vlm" as const },
+    ];
+    const saved = serializeModelWindowRows(rows.filter((row) => row.model !== "remove"));
+    assert.deepStrictEqual(saved, {
+      modelList: "keep",
+      modelWindows: '{"keep":"1M"}',
+      modelVlm: "{}",
+      modelAutoCompact: '{"keep":"90%"}',
+    });
   });
 
   it("mergeModelWindowRows 追加上游模型时跳过已有模型并保留窗口和图片处理", () => {
     assert.deepStrictEqual(
       mergeModelWindowRows(
         [
-          { model: "deepseek-v4-flash", window: "1M", imageHandling: "vlm" },
-          { model: "  ", window: "", imageHandling: "send-as-is" },
+          { model: "deepseek-v4-flash", window: "1M", autoCompact: "90%", imageHandling: "vlm" },
+          { model: "  ", window: "", autoCompact: "", imageHandling: "send-as-is" },
         ],
         [
-          { model: "deepseek-v4-flash", window: "", imageHandling: "send-as-is" },
-          { model: "deepseek-v4-pro", window: "", imageHandling: "vlm" },
-          { model: " deepseek-v4-pro ", window: "200K", imageHandling: "send-as-is" },
+          { model: "deepseek-v4-flash", window: "", autoCompact: "", imageHandling: "send-as-is" },
+          { model: "deepseek-v4-pro", window: "", autoCompact: "", imageHandling: "vlm" },
+          { model: " deepseek-v4-pro ", window: "200K", autoCompact: "", imageHandling: "send-as-is" },
         ],
       ),
       [
-        { model: "deepseek-v4-flash", window: "1M", imageHandling: "vlm" },
-        { model: "deepseek-v4-pro", window: "", imageHandling: "vlm" },
+        { model: "deepseek-v4-flash", window: "1M", autoCompact: "90%", imageHandling: "vlm" },
+        { model: "deepseek-v4-pro", window: "", autoCompact: "", imageHandling: "vlm" },
       ],
     );
   });
@@ -175,8 +222,36 @@ describe("model-windows helpers", () => {
   it("供应商编辑器在损坏 modelWindows 时阻止保存，只有显式编辑行才解除错误", async () => {
     const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
     assert.match(source, /const validationError = modelWindowsValidationError\s+\?\?/);
-    assert.match(source, /if \(validationError\) return;/);
+    assert.match(source, /if \(savingDraft \|\| validationError \|\| modelRowsError\) return;/);
     assert.match(source, /setModelWindowState\(\{ rows, validationError: null \}\)/);
     assert.match(source, /<p className="field-hint" role="alert">\{modelWindowsValidationError\}<\/p>/);
+  });
+
+  it("旧配置读取后直接保存不会产生 90% 自动压缩覆盖", () => {
+    const loaded = modelWindowRowsFromProfile("a\nb", '{"a":"1M"}');
+    assert.equal(loaded.validationError, null);
+    const saved = serializeModelWindowRows(loaded.rows);
+    assert.equal(saved.modelAutoCompact, "{}");
+    assert.equal(saved.modelWindows, '{"a":"1M"}');
+  });
+
+  it("逐模型百分比保持精度，空值仍不写覆盖", () => {
+    const loaded = modelWindowRowsFromProfile("a\nb", "{}", "{}", '{"a":"85.123456%"}');
+    assert.equal(loaded.validationError, null);
+    assert.equal(serializeModelWindowRows(loaded.rows).modelAutoCompact, '{"a":"85.123456%"}');
+  });
+
+  it("单独损坏的自动压缩 JSON 也必须阻止保存", () => {
+    for (const value of ["not-json", "null", "[]", '{"a":90}']) {
+      const loaded = modelWindowRowsFromProfile("a", '{"a":"1M"}', "{}", value);
+      assert.ok(loaded.validationError?.includes("自动压缩"));
+      assert.equal(loaded.rows[0].window, "1M");
+    }
+  });
+
+  it("编辑器失焦与 metadata 导入不强制补 90%", async () => {
+    const source = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+    assert.doesNotMatch(source, /normalized \|\| DEFAULT_AUTO_COMPACT_PERCENT/);
+    assert.doesNotMatch(source, /autoCompactPercent \?\? DEFAULT_AUTO_COMPACT_PERCENT/);
   });
 });

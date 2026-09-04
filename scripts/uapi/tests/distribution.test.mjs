@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 const manifest = JSON.parse(
@@ -104,6 +105,27 @@ test("production manager entry uses the isolated U-API shell", () => {
   assert.match(managerEntry, /\.\/uapi\/UapiApp/);
   assert.doesNotMatch(managerEntry, /from\s+["']\.\/App["']/);
   assert.deepEqual(manifest.visibleRoutes, ["overview", "connection", "maintenance", "about"]);
+});
+
+test("pinned upstream preview is reproducible and cannot pass the release gate", () => {
+  const base = readFileSync(new URL("../../../distribution/upstream-base.txt", import.meta.url), "utf8").trim();
+  assert.match(base, /^(?:[0-9a-f]{40}|v\d+\.\d+\.\d+)$/);
+  assert.match(upstreamSurfaceAudit, /distribution\/upstream-base\.txt/);
+  assert.match(upstreamSurfaceAudit, /git merge-base --is-ancestor "\$base_commit" HEAD/);
+  assert.match(releaseWorkflow, /UAPI_REQUIRE_STABLE_UPSTREAM: "1"/);
+  assert.match(upstreamSurfaceAudit, /unreleased upstream preview cannot be published/);
+  assert.match(managedIntegration, /settings\.codex_app_answer_outline_enabled = false/);
+
+  // 只在本轮预览基线上检查拒绝路径，下一稳定 tag 的正常发布不应被测试误拦。
+  if (base === "11179a0100afb3b04c0342ccc9a3159fa25f8b4d") {
+    const result = spawnSync("bash", ["scripts/uapi/audit-upstream-surface.sh"], {
+      cwd: new URL("../../../", import.meta.url),
+      env: { ...process.env, UAPI_REQUIRE_STABLE_UPSTREAM: "1" },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /unreleased upstream preview cannot be published/);
+  }
 });
 
 test("Windows uninstall registration and cleanup are fail closed", () => {

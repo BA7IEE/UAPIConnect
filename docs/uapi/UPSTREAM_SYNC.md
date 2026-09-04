@@ -13,6 +13,13 @@ git remote add origin <your fork>
 最新 release，再决定目标版本。这样 Windows、macOS 安装测试都有一个可复现的
 上游基线；确实需要未发布修复时，单独记录目标 commit 和原因。
 
+`distribution/upstream-base.txt` 记录定制范围审计的精确基线，优先于 Cargo 版本号。
+稳定集成填写对应 `v<version>`，预适配填写完整 commit SHA。新合并完成后再更新该文件，
+审计会检查基线必须在当前提交历史中。不要通过扩大资源目录白名单绕过审计。
+正式发布工作流还要求基线与 Cargo 版本对应的稳定 tag 完全相同，未发布预览基线会被拒绝。
+
+当前预适配进度见 [2026-09-04 升级记录](2026-09-04-upstream-preview.md)。
+
 当前历史已经和上游连通，禁止再使用 `--allow-unrelated-histories`，也不要把旧版
 大提交整体重放到新版源码上。
 

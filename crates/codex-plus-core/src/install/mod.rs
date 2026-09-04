@@ -11,6 +11,7 @@ pub mod windows;
 pub const SILENT_NAME: &str = crate::distribution::PRODUCT_NAME;
 pub const MANAGER_NAME: &str = crate::distribution::MANAGER_DISPLAY_NAME;
 pub const SILENT_BINARY: &str = "codex-plus-plus";
+pub const MACOS_SILENT_EXECUTABLE: &str = "CodexPlusPlus";
 pub const MANAGER_BINARY: &str = "codex-plus-plus-manager";
 pub const SILENT_BUNDLE_ID: &str = crate::distribution::SILENT_BUNDLE_ID;
 pub const MANAGER_BUNDLE_ID: &str = crate::distribution::MANAGER_BUNDLE_ID;
@@ -337,6 +338,24 @@ fn macos_open_bundle_arguments(bundle_id: &str, args: &[OsString]) -> Vec<OsStri
     ];
     open_args.extend(args.iter().cloned());
     open_args
+}
+
+pub fn open_or_activate_manager() -> anyhow::Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+        if let Some(bundle_id) = macos_companion_bundle_identifier_from_exe(&exe, MANAGER_BINARY) {
+            let activated = Command::new("/usr/bin/open")
+                .args(["-b", bundle_id])
+                .status()
+                .is_ok_and(|status| status.success());
+            if activated {
+                return Ok(format!("bundle:{bundle_id}"));
+            }
+        }
+    }
+
+    spawn_companion(MANAGER_BINARY, std::iter::empty::<&str>())
 }
 
 pub fn macos_companion_bundle_identifier_from_exe(

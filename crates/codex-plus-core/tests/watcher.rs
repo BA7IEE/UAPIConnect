@@ -1,8 +1,8 @@
 use codex_plus_core::watcher::{
     LauncherProcessInfo, build_spawn_launcher_command, build_watcher_install_plan, cdp_listening,
     codex_process_ids, disable_watcher_at, enable_watcher_at, filter_owned_launcher_processes,
-    process_id_is_running, process_ids_still_running, should_recover_stale_launcher,
-    terminate_revalidated_launcher_processes, watcher_disabled_flag,
+    macos_launcher_process_names, process_id_is_running, process_ids_still_running,
+    should_recover_stale_launcher, terminate_revalidated_launcher_processes, watcher_disabled_flag,
 };
 
 #[cfg(windows)]
@@ -232,6 +232,14 @@ fn launcher_termination_accepts_a_pid_that_already_exited() {
     .unwrap();
 
     assert!(!terminated.get());
+}
+
+#[test]
+fn macos_launcher_process_names_cover_development_and_packaged_binaries() {
+    assert_eq!(
+        macos_launcher_process_names(),
+        ["codex-plus-plus", "CodexPlusPlus"]
+    );
 }
 
 #[test]

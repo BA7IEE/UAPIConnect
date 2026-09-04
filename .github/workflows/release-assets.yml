@@ -52,6 +52,8 @@ jobs:
       - name: Validate distribution policy
         run: node --test scripts/uapi/tests/distribution.test.mjs
       - name: Audit customization surface
+        env:
+          UAPI_REQUIRE_STABLE_UPSTREAM: "1"
         run: bash scripts/uapi/audit-upstream-surface.sh
       - name: Validate scripts
         run: |

@@ -1252,9 +1252,9 @@ async fn a_permanently_busy_protocol_proxy_port_reports_what_the_user_should_do(
     );
 }
 
-/// 普通 helper 端口在上面已经挑过空闲的了，占用说明是别的问题，不该白等六秒。
+/// macOS 允许旧 launcher 延迟释放 socket；其他平台的浮动 helper 端口应立即报错。
 #[tokio::test]
-async fn a_busy_floating_helper_port_fails_immediately_without_waiting() {
+async fn a_busy_floating_helper_port_respects_platform_retry_policy() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -1282,7 +1282,14 @@ async fn a_busy_floating_helper_port_fails_immediately_without_waiting() {
             .iter()
             .filter(|event| event.starts_with("start-helper-busy:"))
             .count(),
-        1
+        if cfg!(target_os = "macos") { 31 } else { 1 }
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("launch:"))
     );
 }
 
@@ -1585,6 +1592,8 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             model_insert_mode: codex_plus_core::settings::RelayModelInsertMode::default(),
             model_list: String::new(),
             model_windows: String::new(),
+            model_auto_compact: String::new(),
+            model_metadata: String::new(),
             model_vlm: String::new(),
             vlm_api_key: String::new(),
             vlm_model: String::new(),
@@ -1672,7 +1681,17 @@ async fn launch_starts_helper_when_model_routing_is_enabled() {
 
     let before_stop = events.lock().unwrap().clone();
     assert!(before_stop.contains(&"select-helper:58000".to_string()));
+    assert!(before_stop.contains(&"ensure-protocol-proxy-config".to_string()));
     assert!(before_stop.contains(&"start-helper:57321".to_string()));
+    let ensure = before_stop
+        .iter()
+        .position(|event| event == "ensure-protocol-proxy-config")
+        .unwrap();
+    let start = before_stop
+        .iter()
+        .position(|event| event == "start-helper:57321")
+        .unwrap();
+    assert!(ensure < start);
     assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
 
     handle.wait_for_codex_exit().await.unwrap();
@@ -2012,6 +2031,14 @@ impl LaunchHooks for FakeHooks {
             return Ok(());
         }
         self.event("apply-relay");
+        Ok(())
+    }
+
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.event("ensure-protocol-proxy-config");
         Ok(())
     }
 

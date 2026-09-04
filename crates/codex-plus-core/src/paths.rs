@@ -12,6 +12,7 @@ const PENDING_REMOTE_CONTROL_RECOVERY_FILE: &str = "pending-remote-control-recov
 const SKILLS_STATE_FILE: &str = "skills.json";
 const SKILLS_DIR: &str = "skills";
 const SKILL_BACKUPS_DIR: &str = "skill-backups";
+const PENDING_MANAGER_NAVIGATION_FILE: &str = "pending-manager-navigation.json";
 
 pub fn default_app_state_dir() -> PathBuf {
     let state_dir = if crate::distribution::FIXED_PROVIDER_EDITION {
@@ -81,6 +82,10 @@ pub fn default_skills_state_path() -> PathBuf {
 /// 卸载 skill 时把源目录整体移到这里，方便反悔。不自动轮转删除。
 pub fn default_skill_backups_dir() -> PathBuf {
     default_app_state_dir().join(SKILL_BACKUPS_DIR)
+}
+
+pub fn default_pending_manager_navigation_path() -> PathBuf {
+    default_app_state_dir().join(PENDING_MANAGER_NAVIGATION_FILE)
 }
 
 fn settings_path_for_tests() -> Option<PathBuf> {
@@ -162,5 +167,15 @@ mod tests {
     #[test]
     fn legacy_settings_path_remains_scoped_to_upstream_state_directory() {
         assert!(legacy_upstream_settings_path().ends_with(".codex-session-delete/settings.json"));
+    }
+
+    #[test]
+    fn default_pending_manager_navigation_path_uses_app_state_directory() {
+        let path = default_pending_manager_navigation_path();
+
+        assert_eq!(
+            path,
+            default_app_state_dir().join("pending-manager-navigation.json")
+        );
     }
 }
