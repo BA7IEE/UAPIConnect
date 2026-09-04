@@ -337,6 +337,8 @@ where
     let debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
+    let compatibility_only = crate::uapi::desktop_compatibility_enabled(&settings);
+    let renderer_enabled = settings.enhancements_enabled || compatibility_only;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let status_store = options.status_store.clone();
     let mut helper_started = false;
@@ -445,7 +447,7 @@ where
         keep_launched_on_error = true;
 
         let mut injection_degraded = false;
-        if settings.enhancements_enabled {
+        if renderer_enabled {
             let injection_ready = hooks
                 .ensure_injection(debug_port, helper_port, &app_dir)
                 .await;
@@ -453,15 +455,21 @@ where
                 keep_launched_on_error = false;
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
-                crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
-                    debug_port,
-                )
-                .await;
+                if !compatibility_only {
+                    crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
+                        debug_port,
+                    )
+                    .await;
+                }
                 hooks.start_bridge_watchdog(debug_port, helper_port).await?;
             } else {
                 let degraded = launch_status(
                     "running_degraded",
-                    "Codex launched; Codex++ enhancements are still waiting for the page bridge.",
+                    if compatibility_only {
+                        "Codex 已启动，但中文和推理菜单兼容处理尚未就绪。"
+                    } else {
+                        "Codex launched; Codex++ enhancements are still waiting for the page bridge."
+                    },
                     debug_port,
                     helper_port,
                     &app_dir,
@@ -472,7 +480,7 @@ where
             }
         }
 
-        if !settings.enhancements_enabled || !injection_degraded {
+        if !renderer_enabled || !injection_degraded {
             let status = launch_status(
                 "running",
                 "Codex++ launcher ready",
@@ -945,10 +953,13 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
+        let compatibility_only =
+            crate::uapi::desktop_compatibility_enabled(&self.load_settings().await?);
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             #[cfg(windows)]
-            let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
+            let pet_cursor_task = (!compatibility_only)
+                .then(|| tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port)));
             let mut observed_browser_id: Option<String> = None;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
@@ -967,6 +978,12 @@ impl LaunchHooks for DefaultLaunchHooks {
                         if let Some(current) = current_browser_id {
                             observed_browser_id = Some(current);
                         }
+                        if compatibility_only {
+                            check_and_reinject_bridge_inner(
+                                debug_port, helper_port, identity_changed, bridge_reinjector.clone(),
+                            ).await;
+                            continue;
+                        }
                         let (pet_result, _) = tokio::join!(
                             sync_pet_real_mouse_overlay(debug_port, helper_port),
                             check_and_reinject_bridge_inner(
@@ -981,7 +998,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
             #[cfg(windows)]
-            {
+            if let Some(pet_cursor_task) = pet_cursor_task {
                 pet_cursor_task.abort();
                 let _ = pet_cursor_task.await;
             }
@@ -2552,6 +2569,9 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
     let settings = SettingsStore::default().load().unwrap_or_default();
+    if crate::uapi::desktop_compatibility_enabled(&settings) {
+        return crate::uapi::install_desktop_compatibility(websocket_url, &settings).await;
+    }
     let script = crate::assets::injection_script_with_settings(helper_port, &settings);
     let ctx = crate::routes::BridgeContext::core(Arc::new(crate::routes::CoreRuntimeService::new(
         debug_port,

@@ -386,6 +386,13 @@ fn first_bundled_template_entry() -> Option<Value> {
 }
 
 fn gpt56_metadata_entry(slug: &str) -> Option<Value> {
+    // 官方无后缀别名对应 Sol；只复用能力，不能把发给中转站的模型 ID 改掉。
+    if slug == "gpt-5.6" {
+        let mut entry = catalog_metadata_entry(GPT56_METADATA_JSON, "gpt-5.6-sol")?;
+        entry["slug"] = json!(slug);
+        entry["display_name"] = json!("GPT-5.6");
+        return Some(entry);
+    }
     catalog_metadata_entry(GPT56_METADATA_JSON, slug)
 }
 

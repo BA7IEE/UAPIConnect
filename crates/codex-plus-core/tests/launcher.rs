@@ -1113,6 +1113,67 @@ async fn launch_lifecycle_skips_helper_and_injection_when_enhancements_disabled(
 }
 
 #[tokio::test]
+async fn uapi_without_enhancements_injects_only_compatibility_and_reports_failure() {
+    for fail in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Codex.app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let settings = BackendSettings {
+            enhancements_enabled: false,
+            relay_profiles_enabled: true,
+            active_relay_id: "uapi_connect".to_string(),
+            relay_profiles: vec![RelayProfile {
+                id: "uapi_connect".to_string(),
+                protocol: RelayProtocol::Responses,
+                relay_mode: RelayMode::PureApi,
+                config_contents: "model_provider = \"uapi_connect\"\n[model_providers.uapi_connect]\nbase_url = \"https://token.u-studio.cn/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\n".to_string(),
+                ..RelayProfile::default()
+            }],
+            ..BackendSettings::default()
+        };
+        let mut hooks = FakeHooks::new(events.clone()).with_settings(settings);
+        if fail {
+            hooks = hooks.with_inject_error("compatibility unavailable");
+        }
+        let handle = launch_and_inject_with_hooks(
+            LaunchOptions {
+                app_dir: Some(app_dir),
+                debug_port: 9229,
+                helper_port: 57321,
+                status_store,
+            },
+            &hooks,
+        )
+        .await
+        .unwrap();
+        handle.wait_for_codex_exit().await.unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| event == "inject:9229:57321"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.starts_with("start-helper:"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.starts_with("shutdown-helper:"))
+        );
+        assert!(events.iter().any(|event| event
+            == if fail {
+                "status:running_degraded"
+            } else {
+                "status:running"
+            }));
+        if fail {
+            assert!(!events.iter().any(|event| event == "status:running"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn official_mix_responses_profile_starts_fixed_protocol_proxy_without_enhancements() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");

@@ -1100,6 +1100,10 @@ async fn try_inject_with_context(
     let settings = codex_plus_core::settings::SettingsStore::default()
         .load()
         .unwrap_or_default();
+    if codex_plus_core::uapi::desktop_compatibility_enabled(&settings) {
+        return codex_plus_core::uapi::install_desktop_compatibility(websocket_url, &settings)
+            .await;
+    }
     let script = codex_plus_core::assets::injection_script_with_settings(helper_port, &settings);
     let user_bundle = runtime
         .user_scripts

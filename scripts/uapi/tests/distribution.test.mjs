@@ -107,6 +107,18 @@ test("production manager entry uses the isolated U-API shell", () => {
   assert.deepEqual(manifest.visibleRoutes, ["overview", "connection", "maintenance", "about"]);
 });
 
+test("desktop compatibility stays separate from full enhancements and user scripts", () => {
+  const compat = readFileSync(new URL("../../../crates/codex-plus-core/src/uapi/desktop_compat.rs", import.meta.url), "utf8");
+  const launcher = readFileSync(new URL("../../../apps/codex-plus-launcher/src/main.rs", import.meta.url), "utf8");
+  assert.match(managedIntegration, /settings\.enhancements_enabled = false/);
+  assert.match(compat, /!settings\.enhancements_enabled/);
+  assert.match(compat, /managed_profile_is_owned/);
+  assert.match(compat, /path == "\/backend\/status"/);
+  assert.match(compat, /state\.gates === "ready"/);
+  const injection = launcher.slice(launcher.indexOf("async fn try_inject_with_context("));
+  assert.ok(injection.indexOf("return codex_plus_core::uapi::install_desktop_compatibility") < injection.indexOf(".build_enabled_bundle()"));
+});
+
 test("pinned upstream preview is reproducible and cannot pass the release gate", () => {
   const base = readFileSync(new URL("../../../distribution/upstream-base.txt", import.meta.url), "utf8").trim();
   assert.match(base, /^(?:[0-9a-f]{40}|v\d+\.\d+\.\d+)$/);

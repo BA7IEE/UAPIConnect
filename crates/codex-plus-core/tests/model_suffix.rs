@@ -124,7 +124,7 @@ fn build_catalog_json_uses_fallback_for_no_suffix_entries() {
 #[test]
 fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
     let entries = collect_catalog_entries(
-        "gpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna",
+        "gpt-5.6\ngpt-5.6-sol\ngpt-5.6-terra\ngpt-5.6-luna",
         &HashMap::new(),
         &HashMap::new(),
         "gpt-5.6-sol",
@@ -134,6 +134,11 @@ fn build_catalog_json_uses_runtime_compatible_gpt56_metadata() {
     let models = catalog["models"].as_array().unwrap();
 
     for (slug, default_reasoning, expected_efforts) in [
+        (
+            "gpt-5.6",
+            "low",
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"],
+        ),
         (
             "gpt-5.6-sol",
             "low",

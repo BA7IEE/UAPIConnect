@@ -5,6 +5,11 @@
 //! relay, model-catalog, backup and rollback code remains reusable.
 
 mod credentials;
+mod desktop_compat;
+
+pub use desktop_compat::{
+    desktop_compatibility_enabled, desktop_compatibility_script, install_desktop_compatibility,
+};
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::ErrorKind;
@@ -949,7 +954,7 @@ fn build_managed_profile(selected_model: &str, models: &[String]) -> anyhow::Res
         })
         .collect::<BTreeMap<_, _>>();
     let config_contents = format!(
-        "model = {}\nmodel_provider = {}\n\n[model_providers.{}]\nname = {}\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = false\n",
+        "model = {}\nmodel_provider = {}\n\n[model_providers.{}]\nname = {}\nbase_url = {}\nwire_api = \"responses\"\nrequires_openai_auth = true\n",
         toml_string(selected_model),
         toml_string(distribution::FIXED_PROVIDER_ID),
         distribution::FIXED_PROVIDER_ID,
@@ -1393,7 +1398,8 @@ fn legacy_settings_has_owned_marker(path: &Path) -> anyhow::Result<bool> {
         "base_url = \\\"{}\\\"",
         distribution::FIXED_BASE_URL
     )) && raw.contains("wire_api = \\\"responses\\\"")
-        && raw.contains("requires_openai_auth = false"))
+        && (raw.contains("requires_openai_auth = false")
+            || raw.contains("requires_openai_auth = true")))
 }
 
 fn read_legacy_managed_profiles(
@@ -2137,7 +2143,9 @@ fn managed_provider_table_is_owned(provider: &dyn TableLike) -> bool {
         .and_then(Item::as_str)
         .is_some_and(|url| normalize_base_url(url) == distribution::FIXED_BASE_URL)
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
-        && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(false)
+        // false 是旧版生成值，true 是使用 auth.json 中 API Key 的修正值。
+        // 两者都可迁移；缺失或非布尔值仍不能作为受管配置的归属依据。
+        && provider.get("requires_openai_auth").and_then(Item::as_bool).is_some()
 }
 
 /// Rebuilds the persisted managed profile from the only data users are allowed
@@ -2925,8 +2933,8 @@ fn upsert_managed_profile(settings: &mut BackendSettings, profile: RelayProfile)
 
 pub fn apply_distribution_feature_defaults(settings: &mut BackendSettings) {
     // The managed edition relies on native Codex configuration and model_catalog_json.
-    // Disabling page injection also removes the upstream ads, scripts, themes and
-    // advanced Codex++ menu from the customer-facing Codex window.
+    // 完整页面增强保持关闭；启动器只加载独立的语言/原生推理菜单兼容层，
+    // 不加载广告、自定义脚本、主题或高级 Codex++ 菜单。
     settings.enhancements_enabled = false;
     settings.provider_sync_enabled = false;
     settings.provider_sync_saved_providers.clear();
@@ -3476,6 +3484,11 @@ mod tests {
                 .contains("[model_providers.uapi_connect]")
         );
         assert!(!profile.config_contents.contains("[model_providers.custom]"));
+        assert!(
+            profile
+                .config_contents
+                .contains("requires_openai_auth = true")
+        );
     }
 
     #[test]
@@ -3518,13 +3531,97 @@ mod tests {
             .replace("wire_api = \"responses\"", "wire_api = \"chat\"");
         assert!(!managed_profile_is_owned(&wrong_wire));
 
-        let mut requires_openai_auth =
+        let mut invalid_auth =
             build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
-        requires_openai_auth.config_contents = requires_openai_auth.config_contents.replace(
-            "requires_openai_auth = false",
+        invalid_auth.config_contents = invalid_auth.config_contents.replace(
             "requires_openai_auth = true",
+            "requires_openai_auth = \"true\"",
         );
-        assert!(!managed_profile_is_owned(&requires_openai_auth));
+        assert!(!managed_profile_is_owned(&invalid_auth));
+    }
+
+    #[test]
+    fn legacy_auth_flag_is_owned_and_canonicalized_to_use_auth_json() {
+        let mut legacy =
+            build_managed_profile("gpt-5-codex", &["gpt-5-codex".to_string()]).unwrap();
+        legacy.config_contents = legacy.config_contents.replace(
+            "requires_openai_auth = true",
+            "requires_openai_auth = false",
+        );
+        assert!(managed_profile_is_owned(&legacy));
+        assert!(managed_profile_value_is_owned(
+            &serde_json::to_value(&legacy).unwrap()
+        ));
+        let canonical = canonicalize_managed_profile(&legacy).unwrap();
+        assert!(
+            canonical
+                .config_contents
+                .contains("requires_openai_auth = true")
+        );
+        assert!(
+            !canonical
+                .config_contents
+                .contains("requires_openai_auth = false")
+        );
+    }
+
+    #[test]
+    fn launch_upgrades_legacy_and_manually_fixed_auth_without_reentering_key() {
+        for old_flag in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("codex-home");
+            std::fs::create_dir_all(&home).unwrap();
+            let store = SettingsStore::new(temp.path().join("settings.json"));
+            let mut profile = build_managed_profile("gpt-5.6", &["gpt-5.6".to_string()]).unwrap();
+            profile.config_contents = profile.config_contents.replace(
+                "requires_openai_auth = true",
+                &format!("requires_openai_auth = {old_flag}"),
+            );
+            std::fs::write(home.join("config.toml"), &profile.config_contents).unwrap();
+            let key = "test-auth-upgrade-key";
+            std::fs::write(
+                home.join("auth.json"),
+                json!({"OPENAI_API_KEY": key}).to_string(),
+            )
+            .unwrap();
+            store
+                .save(&managed_settings(profile, UapiConnectionMode::Uapi))
+                .unwrap();
+            let vault = MemoryCredentialVault::default();
+            vault.set(CredentialSlot::UapiApiKey, key).unwrap();
+
+            apply_active_connection_profile_with(&store, &home, &vault).unwrap();
+
+            let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            assert!(config.contains("requires_openai_auth = true"));
+            assert!(config.contains("model_catalog_json"));
+            assert!(!config.contains(key));
+            let auth: Value =
+                serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+            assert_eq!(auth["OPENAI_API_KEY"], key);
+            let catalog: Value =
+                serde_json::from_slice(&std::fs::read(managed_catalog_path(&home)).unwrap())
+                    .unwrap();
+            let model = &catalog["models"][0];
+            assert_eq!(model["slug"], "gpt-5.6");
+            assert_eq!(model["display_name"], "GPT-5.6");
+            let efforts = model["supported_reasoning_levels"].as_array().unwrap();
+            for effort in ["max", "ultra"] {
+                assert!(efforts.iter().any(|entry| entry["effort"] == effort));
+            }
+            assert!(
+                !serde_json::to_string(&store.load().unwrap())
+                    .unwrap()
+                    .contains(key)
+            );
+            switch_connection_mode_with(&store, &home, &vault, UapiConnectionMode::Official)
+                .unwrap();
+            assert!(
+                !std::fs::read_to_string(home.join("config.toml"))
+                    .unwrap()
+                    .contains("[model_providers.uapi_connect]")
+            );
+        }
     }
 
     #[test]
@@ -6859,8 +6956,8 @@ mod tests {
             ("wire", "wire_api = \"responses\"", "wire_api = \"chat\""),
             (
                 "auth",
-                "requires_openai_auth = false",
                 "requires_openai_auth = true",
+                "requires_openai_auth = \"true\"",
             ),
         ] {
             let temp = tempfile::tempdir().unwrap();
