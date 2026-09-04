@@ -30,12 +30,29 @@
 - [x] Rust 完整工作区 1,382 项通过、2 项沿用上游忽略，格式检查通过。
 - [x] 15 项发行策略测试；预览基线的正式发布拦截已实际执行验证。
 - [x] Node Playwright 页面烟测：模拟密钥保存后清空、模式往返、四页导航、主题、无横向溢出、状态读取失败提示。
-- [ ] 本地 Release 构建。
-- [ ] 发行策略和精确基线审计。
-- [ ] 候选分支 Windows x64、macOS arm64/x64 CI。
+- [x] 本地 Release 构建。
+- [x] 发行策略和精确基线审计。
+- [x] 候选分支 Windows x64、macOS arm64/x64 CI 全部通过。
+- [x] Windows 安装、运行中升级、失败回滚与卸载自动测试通过，安装包已上传。
+- [x] macOS arm64 和 x64 DMG 已生成并上传。
 - [ ] Windows 11 真机安装、覆盖升级、官方/UAPI 往返、对话与卸载。
 
 自动化测试不能代替真实 Windows、真实 Codex 和真实服务验收；未通过前不推广为稳定版。
 
 本地使用已有工具链与依赖，没有安装新依赖。页面烟测采用模拟 Tauri 返回值，不读取真实
 凭证或修改用户 Codex 配置。两个忽略用例分别需要公共主题仓库和正在运行的 Codex CDP。
+
+候选代码提交为 `e51052d5895f3d8f8a2c5e74f11f3a4851804a18`，云端验收见
+[GitHub Actions 33893776582](https://github.com/BA7IEE/UAPIConnect/actions/runs/33893776582)。
+
+CI 于 2026-09-05 完成：Windows x64 用时 18 分 9 秒，macOS x64 用时 18 分 11 秒，
+macOS arm64 用时 10 分 47 秒；发行策略检查通过。三个临时产物分别为
+`uapi-connect-windows-x64`、`uapi-connect-macos-x64`、`uapi-connect-macos-arm64`。
+它们仅用于候选验收，不是正式 Release。后续文档提交只记录结果，不改变被验证的代码。
+
+## 正式升级前仍待完成
+
+1. 等待上游发布稳定 tag，合并最终版本并重新跑全部验证。
+2. 把精确审计基线改为新 tag，不扩大资源目录白名单。
+3. 按 [Windows 真机验收](WINDOWS_ACCEPTANCE.md) 完成真实 Codex 对话、官方/UAPI 往返、覆盖安装与卸载。
+4. 验收通过后再合并 main，并由单独的正式发布流程生成 Release；本轮未进行这两步。
